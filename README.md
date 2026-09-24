@@ -19,7 +19,11 @@ It is a static site with no build step. ES modules need an HTTP server, so it do
 npm start            # serves http://localhost:8080
 ```
 
-Any static host works too, for example GitHub Pages. pdf.js is loaded from jsDelivr at runtime.
+Any static host works too. pdf.js is loaded from jsDelivr at runtime.
+
+### GitHub Pages
+
+`.github/workflows/pages.yml` runs the tests and publishes `index.html`, `css/` and `js/` to GitHub Pages on every push to `main` (or the current default branch), or when run by hand from the Actions tab. The site is served at `https://<owner>.github.io/<repo>/`. If the first run fails at *Configure Pages*, open **Settings → Pages**, set **Source** to **GitHub Actions**, and re-run the workflow.
 
 To get a single self-contained HTML file (CSS and JS inlined):
 
