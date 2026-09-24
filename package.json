@@ -1,0 +1,25 @@
+{
+  "name": "quizmaster",
+  "version": "1.0.0",
+  "description": "Turn PDF question papers into timed multiple-choice tests",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "start": "node scripts/serve.mjs",
+    "parse": "node scripts/parse-pdf.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HAZRATBRO/QuizMaster.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/HAZRATBRO/QuizMaster/issues"
+  },
+  "homepage": "https://github.com/HAZRATBRO/QuizMaster#readme",
+  "devDependencies": {
+    "pdfjs-dist": "^4.10.38"
+  },
+  "type": "module"
+}
