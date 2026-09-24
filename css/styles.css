@@ -444,3 +444,12 @@ table.data tr.current td { background: var(--accent-soft); }
 }
 .report-grid .panel { align-content: start; }
 .tchart-body { margin-top: 8px; }
+
+.offer {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 14px; border-radius: var(--radius);
+  background: var(--accent-soft); font-size: 14px;
+}
+.offer span { flex: 1 1 280px; }
+.select { border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; background: var(--surface); max-width: 100%; font-size: 13px; }
+.catalog { display: grid; gap: 10px; }
+.catalog .quiz-card { background: var(--surface-2); }

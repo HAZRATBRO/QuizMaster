@@ -60,3 +60,21 @@ test('englishScore separates English from legacy Hindi fonts', () => {
   assert.ok(englishScore('Which of the following statements is correct?') > 0.3);
   assert.ok(englishScore('fuEufyf•r esa ls dkSu&lk dFku lgh gS') < 0.06);
 });
+
+test('reads an answer-key table page and keeps it out of the questions', () => {
+  const rows = [];
+  for (let r = 0; r < 30; r++) {
+    for (let c = 0; c < 5; c++) {
+      const n = r + 1 + c * 30;
+      rows.push([60 + c * 100, 100 + r * 20, String(n)], [100 + c * 100, 100 + r * 20, 'ABCD'[n % 4]]);
+    }
+  }
+  const keyPage = page(1, rows);
+  const qPage = page(2, [
+    [60, 100, '1. Which of the following is the capital of India?'],
+    [82, 118, '(a) Mumbai'], [82, 136, '(b) New Delhi'], [82, 154, '(c) Kolkata'], [82, 172, '(d) Chennai'],
+  ]);
+  const { questions, keyText } = parseQuestions([keyPage, qPage]);
+  assert.equal(questions.length, 1);
+  assert.match(keyText, /1 B 31 D 61 B 91 D 121 B/);
+});

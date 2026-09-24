@@ -125,6 +125,14 @@ function buildLines(items, pageNo, col) {
       }
       prev = it;
     }
+    // A bare list marker ("1.", "(a)") set apart from its text by a tab belongs with that text.
+    for (let i = runs.length - 2; i >= 0; i--) {
+      if (/^\s*(\(?[a-hA-H]\)|\(?\d{1,2}[.)]|[A-H]\.|\([ivx]{1,4}\))\s*$/.test(runs[i].text) && runs[i + 1].x - runs[i].x2 < 40) {
+        runs[i].text = `${runs[i].text.trim()} ${runs[i + 1].text}`;
+        runs[i].x2 = runs[i + 1].x2;
+        runs.splice(i + 1, 1);
+      }
+    }
     for (const r of runs) r.text = r.text.replace(/\s+/g, ' ').replace(/\(\s+([a-eA-E1-5])\s*\)/g, '($1)').trim();
     const clean = runs.filter((r) => r.text);
     if (!clean.length) continue;
@@ -178,7 +186,12 @@ function layoutLines(pages) {
     }
     gaps.sort((a, b) => a - b);
     const lineGap = gaps.length >= 3 ? gaps[Math.floor(gaps.length * 0.3)] : null;
+    // Where ordinary text starts on this page. Question numbers hang to the left of it; statement
+    // numbers ("1.", "2.") sit at or right of it. Scanned pages drift, so this is measured per page.
+    const bodyXs = c.lines.filter((l) => !/^\W{0,2}\w{1,3}\W{0,2}\s/.test(l.runs[0].text) && l.runs[0].text.length > 3).map((l) => l.x);
+    const bodyX = bodyXs.length >= 3 ? median(bodyXs) : null;
     for (const l of c.lines) {
+      l.bodyX = bodyX;
       l.colLeft = c.left;
       l.colRight = c.right;
       l.lineGap = lineGap;
@@ -189,29 +202,58 @@ function layoutLines(pages) {
 
 // ---------- language filtering ----------
 
+const devShare = (text) => {
+  const chars = text.replace(/\s/g, '').length;
+  return chars ? (text.match(DEVANAGARI) || []).length / chars : 0;
+};
+
 function filterEnglish(columns) {
   const scored = columns.map((c) => {
-    const text = c.lines.map((l) => l.text).join(' ');
-    const words = (text.match(/[A-Za-zऀ-ॿ]{2,}/g) || []).length;
-    return { c, score: englishScore(text), words };
+    // Score only the Latin-script lines: a column may hold both languages (Unicode Hindi below English).
+    const latin = c.lines.filter((l) => devShare(l.text) < 0.3).map((l) => l.text).join(' ');
+    const words = (latin.match(/[A-Za-z]{2,}/g) || []).length;
+    const devLines = c.lines.length - c.lines.filter((l) => devShare(l.text) < 0.3).length;
+    return { c, score: englishScore(latin), words, devLines };
   });
   const hasEnglish = scored.some((s) => s.score !== null && s.score >= 0.12 && s.words >= 20);
   const droppedPages = new Set();
   const kept = [];
   for (const s of scored) {
-    const isOther = s.score !== null && s.words >= 12 && s.score < 0.06;
+    // Legacy-font Hindi reads as Latin gibberish with almost no English words.
+    const isOther = (s.score !== null && s.words >= 12 && s.score < 0.06) || (s.words < 5 && s.devLines > 3);
     if (hasEnglish && isOther) {
       droppedPages.add(s.c.page);
       continue;
     }
-    // Bilingual layouts sometimes mix both languages in one column: drop Devanagari lines.
-    s.c.lines = s.c.lines.filter((l) => {
-      const dev = (l.text.match(DEVANAGARI) || []).length;
-      return !hasEnglish || dev < l.text.replace(/\s/g, '').length * 0.3;
-    });
+    if (hasEnglish && s.devLines) droppedPages.add(s.c.page);
+    // Drop the Unicode Hindi lines of mixed columns.
+    s.c.lines = s.c.lines.filter((l) => !hasEnglish || devShare(l.text) < 0.3);
     kept.push(s.c);
   }
   return { columns: kept, droppedPages: droppedPages.size, hasEnglish };
+}
+
+/** Pages that are an answer-key table ("1 A 31 D 61 B …"): returns their text and drops them from the columns. */
+function takeKeyPages(columns, pagesByNo) {
+  const byPage = new Map();
+  for (const c of columns) {
+    if (!byPage.has(c.page)) byPage.set(c.page, []);
+    byPage.get(c.page).push(c);
+  }
+  const keyPages = new Set();
+  const texts = [];
+  for (const [page, cols] of byPage) {
+    const lines = cols.flatMap((c) => c.lines.map((l) => l.text.replace(/\t/g, ' ')));
+    const text = lines.join('\n');
+    const pairs = (text.match(/(?:^|\s)\d{1,3}\s*[.)\-:]?\s*\(?[A-Da-d]\)?(?=\s|$)/g) || []).length;
+    if (pairs >= 20 && pairs >= lines.length * 0.5) {
+      keyPages.add(page);
+      // Re-read the page as full-width rows: the key table's columns must stay paired.
+      const p = pagesByNo.get(page);
+      texts.push(buildLines(p.items, page, 0).map((l) => l.text.replace(/\t/g, ' ')).join('\n'));
+    }
+  }
+  return { columns: columns.filter((c) => !keyPages.has(c.page)), keyText: texts.join('\n') };
 }
 
 // ---------- question segmentation ----------
@@ -221,67 +263,142 @@ const ANSWER_LINE = /^(?:ans(?:wer)?|correct\s+(?:answer|option)|right\s+answer)
 const EXPLANATION_LINE = /^(?:explanation|solution|exp\.)\s*[:.\-–]/i;
 const KEY_HEADING = /^(?:answer\s*key|answers|answer\s*sheet|key\s*answers?)\s*[:\-–]?\s*$/i;
 
+const OPTION_HINT = /(^|\s)[(\[{]?[a-dA-D][)\]}](?=\s|$|[A-Z0-9])/g;
+
+/** Every line that could start a question: a number hanging at the left margin. */
+function questionCandidates(lines) {
+  const out = [];
+  lines.forEach((line, i) => {
+    const m = Q_START.exec(line.runs[0].text);
+    if (!m) return;
+    const n = parseInt(m[1], 10);
+    if (!n) return;
+    const width = Math.max(40, line.colRight - line.colLeft);
+    const rel = line.x - line.colLeft;
+    const strict = rel <= Math.max(10, Math.min(16, width * 0.06));
+    // Scanned pages drift sideways, so also accept a number that hangs left of this page's body text.
+    const hanging = line.bodyX != null && line.x <= line.bodyX - 5 && rel <= width * 0.2;
+    if (!strict && !hanging) return;
+    out.push({ i, n, m, strict, punct: !!m[2], page: line.page });
+  });
+  // A real question is followed by answer options before the next candidate; numbered instructions are not.
+  out.forEach((c, k) => {
+    const stop = k + 1 < out.length ? out[k + 1].i : lines.length;
+    let hints = 0;
+    for (let j = c.i; j < Math.min(stop, c.i + 40); j++) hints += (lines[j].text.match(OPTION_HINT) || []).length;
+    c.weight = 1 + (hints >= 2 ? 1 : 0) + (c.strict ? 0.1 : 0) + (c.punct ? 0.1 : 0);
+  });
+  return out;
+}
+
+/** The best run of question numbers in document order: rising by 1 (small gaps allowed). */
+function numberChain(cands) {
+  const best = new Array(cands.length).fill(0);
+  const prev = new Array(cands.length).fill(-1);
+  let top = -1;
+  for (let k = 0; k < cands.length; k++) {
+    best[k] = cands[k].weight;
+    for (let j = k - 1; j >= 0 && j >= k - 400; j--) {
+      const gap = cands[k].n - cands[j].n;
+      if (gap < 1 || gap > 4) continue;
+      const v = best[j] + cands[k].weight - (gap - 1) * 0.6;
+      if (v > best[k]) {
+        best[k] = v;
+        prev[k] = j;
+      }
+    }
+    if (top < 0 || best[k] > best[top]) top = k;
+  }
+  const chain = [];
+  for (let k = top; k >= 0; k = prev[k]) chain.unshift(cands[k]);
+  // Numbered instructions on a cover page (no options after them) are not questions.
+  const lead = chain.findIndex((c) => c.weight >= 2);
+  if (lead > 0 && chain.slice(0, lead).every((c) => c.page === chain[0].page) && chain[lead].page !== chain[0].page) {
+    chain.splice(0, lead);
+  }
+  // Recover numbers that were misprinted ("5." where "135." belongs) or misread by text
+  // recognition ("25." where "15." belongs) when they fill a gap in the run.
+  const looksLike = (want, got) => {
+    const a = String(want);
+    const b = String(got);
+    if (a.endsWith(b)) return true;
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let k = 0; k < a.length; k++) if (a[k] !== b[k]) diff++;
+    return diff === 1;
+  };
+  const filled = [];
+  chain.forEach((c, k) => {
+    const next = chain[k + 1];
+    filled.push(c);
+    if (!next || next.n - c.n < 2) return;
+    let after = c.i;
+    for (let want = c.n + 1; want < next.n; want++) {
+      const fix = cands.find((x) => x.i > after && x.i < next.i && x.n !== want && x.punct && looksLike(want, x.n));
+      if (!fix) continue;
+      filled.push({ ...fix, misnumbered: fix.n, n: want });
+      after = fix.i;
+    }
+  });
+  return filled;
+}
+
 function segment(lines) {
   const questions = [];
+  const chain = numberChain(questionCandidates(lines));
+  const starts = new Map(chain.map((c) => [c.i, c]));
+  // The run starts at 2 but the page before its first question holds options: that is question 1
+  // with its number lost (common in scans).
+  if (chain.length && chain[0].n === 2) {
+    const first = chain[0].i;
+    let k = first;
+    while (k > 0 && lines[k - 1].page === lines[first].page) k--;
+    const before = lines.slice(k, first).map((l) => l.text).join(' ');
+    if (k < first && (before.match(OPTION_HINT) || []).length >= 2) {
+      starts.set(k, { i: k, n: 1, m: [null, '1', null, lines[k].runs[0].text], misnumbered: 'unreadable' });
+    }
+  }
   let current = null;
-  let last = 0;
   let mode = 'body';
   const keyLines = [];
   let inKey = false;
+  // A question never runs on past the next page with kept text (this stops the last question from
+  // swallowing whatever follows the paper, such as a second paper in the same file).
+  const pageOrder = [...new Set(lines.map((l) => l.page))];
+  const pageIndex = new Map(pageOrder.map((p, k) => [p, k]));
 
-  for (const line of lines) {
+  lines.forEach((line, i) => {
+    if (current && pageIndex.get(line.page) - pageIndex.get(current.startLine.page) > 1) current = null;
     if (inKey) {
       keyLines.push(line.text);
-      continue;
+      return;
     }
-    if (KEY_HEADING.test(line.text.replace(/\t/g, ' '))) {
+    if (questions.length >= 5 && KEY_HEADING.test(line.text.replace(/\t/g, ' '))) {
       inKey = true;
-      continue;
+      return;
     }
-    const m = Q_START.exec(line.runs[0].text);
-    if (m) {
-      let n = parseInt(m[1], 10);
-      let misnumbered = null;
-      const width = Math.max(40, line.colRight - line.colLeft);
-      const rel = line.x - line.colLeft;
-      const atMargin = rel <= Math.max(14, width * 0.06);
-      const punct = !!m[2];
-      let accept = false;
-      if (atMargin && n > 0) {
-        if (n === last + 1) accept = true;
-        else if (last === 0 && punct && (m[3] || '').length > 3) accept = true;
-        else if (punct && n > last + 1 && n <= last + 4) accept = true;
-        else if (punct && n === 1 && last >= 5) accept = true; // a new section restarts numbering
-        else if (punct && n !== last + 1 && String(last + 1).endsWith(String(n)) && last >= 9) {
-          // Misprinted number such as "5." where "135." was expected.
-          misnumbered = n;
-          accept = true;
-        }
-      }
-      if (misnumbered !== null) n = last + 1;
-      if (accept) {
-        const firstRun = { ...line.runs[0], text: m[3] || '' };
-        current = { num: n, lines: [{ ...line, runs: [firstRun, ...line.runs.slice(1)].filter((r) => r.text) }], answer: null, misnumbered };
-        if (!current.lines[0].runs.length) current.lines = [];
-        current.startLine = line;
-        questions.push(current);
-        last = n;
-        mode = 'body';
-        continue;
-      }
+    const start = starts.get(i);
+    if (start) {
+      const firstRun = { ...line.runs[0], text: start.m[3] || '' };
+      current = { num: start.n, lines: [{ ...line, runs: [firstRun, ...line.runs.slice(1)].filter((r) => r.text) }], answer: null, misnumbered: start.misnumbered ?? null };
+      if (!current.lines[0].runs.length) current.lines = [];
+      current.startLine = line;
+      questions.push(current);
+      mode = 'body';
+      return;
     }
-    if (!current) continue;
+    if (!current) return;
     const flat = line.text.replace(/\t/g, ' ');
     const ans = ANSWER_LINE.exec(flat);
     if (ans) {
       current.answer = labelToIndex(ans[1]);
       mode = 'explanation';
-      continue;
+      return;
     }
     if (EXPLANATION_LINE.test(flat)) mode = 'explanation';
-    if (mode === 'explanation') continue;
+    if (mode === 'explanation') return;
     current.lines.push(line);
-  }
+  });
   return { questions, keyText: keyLines.join('\n') };
 }
 
@@ -302,12 +419,14 @@ const FAMILIES = [
   { labels: ['A', 'B', 'C', 'D', 'E'], wrap: (l) => `${l}\\)` },
   { labels: ['a', 'b', 'c', 'd', 'e'], wrap: (l) => `${l}\\.` },
   { labels: ['A', 'B', 'C', 'D', 'E'], wrap: (l) => `${l}\\.` },
+  // Scanned papers: text recognition garbles "(b)" into "bj", "Id)", "(c", "dl" and so on.
+  { labels: ['a', 'b', 'c', 'd'], wrap: (l) => `(?:[(\\[{|lI1]?${l}[)\\]}jl1|]{1,2}|[(\\[{]${l})`, ocr: true },
 ];
 
 function findMarkers(lines, family) {
   const found = [];
   const alt = family.labels.map(family.wrap).join('|');
-  const re = new RegExp(`(^|\\s)(${alt})(?=\\s|$)`, 'g');
+  const re = new RegExp(`(^|\\s)(${alt})(?=\\s|$|[A-Z0-9(])`, 'g');
   lines.forEach((line, li) => {
     line.runs.forEach((run, ri) => {
       re.lastIndex = 0;
@@ -338,12 +457,40 @@ function chooseOptions(lines) {
         chosen.push(next);
       }
       if (chosen.length < 2) continue;
-      // Prefer more options, then the first family listed, then the last candidate block.
+      // "A. … D." items followed by a "Code:" line are List-I of a matching question, not options.
+      if (/^[A-E]$/.test(family.labels[0])) {
+        const lastLi = Math.max(...chosen.map((m) => m.li));
+        if (lines.slice(lastLi + 1).some((l) => /^code\b/i.test(l.runs[0].text) || /(^|\s)\(?[a-d]\)/.test(l.text))) continue;
+      }
+      // Prefer more options, then the first family listed, then the first block. A later block is
+      // usually the same options repeated in the other language.
       const score = chosen.length * 100 - fi;
-      if (!best || score >= best.score) best = { score, chosen };
+      if (!best || score > best.score) {
+        const last = chosen.reduce((a, b) => (after(b, a) ? b : a));
+        const stop = markers.find((m) => m.label === 0 && after(m, last)) || null;
+        best = { score, chosen, stop };
+      }
     }
   });
-  return best ? best.chosen : null;
+  // Scans lose markers: collect whichever labels can still be read after the "Code:" line.
+  if (!best || best.chosen.length < 4) {
+    const codeLine = lines.findIndex((l) => /^code\s*[:;.]?/i.test(l.runs[0].text));
+    FAMILIES.forEach((family, fi) => {
+      if (!/^[a-e]$/.test(family.labels[0])) return;
+      const markers = findMarkers(lines, family).filter((m) => codeLine < 0 || m.li > codeLine);
+      const chosen = [];
+      for (let k = 0; k < 4; k++) {
+        const m = markers.find((x) => x.label === k);
+        if (m) chosen.push(m);
+      }
+      if (chosen.length < 2 || (best && chosen.length <= best.chosen.length)) return;
+      chosen.sort((a, b) => (after(a, b) ? 1 : -1));
+      best = { score: chosen.length * 100 - fi, chosen, stop: null, partial: true };
+    });
+  }
+  if (!best) return null;
+  best.chosen.stop = best.stop;
+  return best.chosen;
 }
 
 function splitOptions(lines, markers) {
@@ -353,7 +500,8 @@ function splitOptions(lines, markers) {
   let seq = 0;
   let prevLine = null;
   const optionLines = new Set();
-  for (let li = start.li; li < lines.length; li++) {
+  const end = markers.stop ? markers.stop.li : lines.length;
+  for (let li = start.li; li < end; li++) {
     const line = lines[li];
     if (prevLine && line.page === prevLine.page && line.col === prevLine.col &&
         line.baseline - prevLine.baseline > 3 * line.size) break; // far below: not part of the options
@@ -483,14 +631,16 @@ export function parseQuestions(inputPages) {
   const pages = inputPages.map((p) => ({ ...p, items: [...p.items] }));
   const pagesByNo = new Map(pages.map((p) => [p.page, p]));
   removeRepeatedText(pages);
-  const laidOut = layoutLines(pages);
+  const { columns: laidOut, keyText: tableKey } = takeKeyPages(layoutLines(pages), pagesByNo);
   const { columns, droppedPages, hasEnglish } = filterEnglish(laidOut);
   const lines = columns.flatMap((c) => c.lines);
-  const { questions: raw, keyText } = segment(lines);
+  const { questions: raw, keyText: trailingKey } = segment(lines);
+  const keyText = [tableKey, trailingKey].filter(Boolean).join('\n');
 
   let questions = raw.map((q) => {
     const warnings = [];
-    if (q.misnumbered !== null && q.misnumbered !== undefined) warnings.push(`Printed as question ${q.misnumbered} in the PDF.`);
+    if (q.misnumbered === 'unreadable') warnings.push('The question number could not be read in the PDF.');
+    else if (q.misnumbered !== null && q.misnumbered !== undefined) warnings.push(`Printed as question ${q.misnumbered} in the PDF.`);
     const markers = chooseOptions(q.lines);
     let stemLines = q.lines;
     let options = [];
@@ -504,7 +654,9 @@ export function parseQuestions(inputPages) {
       if (lead) before.push({ ...firstLine.runs[first.ri], text: lead });
       if (before.length) stemLines = [...stemLines, { ...firstLine, runs: before }];
       const split = splitOptions(q.lines, markers);
-      options = split.options;
+      // Place each option by its label: a scan may have lost some markers.
+      markers.forEach((m, k) => { options[m.label] = split.options[k]; });
+      options = Array.from({ length: Math.max(...markers.map((m) => m.label)) + 1 }, (_, k) => options[k] || '');
       optionLineIdx = split.optionLines;
     } else {
       warnings.push('No answer options were found.');
@@ -513,15 +665,21 @@ export function parseQuestions(inputPages) {
     applyCodeHeader(stem, options);
     if (options.length && options.length < 4) warnings.push(`Only ${options.length} options were found.`);
     if (options.some((o) => !o)) warnings.push('An option is empty.');
-    const used = q.lines.filter((l, i) => i < (markers ? markers[0].li : q.lines.length) || optionLineIdx.has(i));
+    // Where the options could not all be read, keep the whole block so the PDF snippet shows them.
+    const used = options.length < 4 || options.some((o) => !o)
+      ? q.lines
+      : q.lines.filter((l, i) => i < markers[0].li || optionLineIdx.has(i));
     const regionLines = [q.startLine, ...used.filter((l) => l !== q.lines[0])];
     const text = [stem.map((b) => (b.type === 'p' ? b.text : b.rows.flat().join(' '))).join(' '), ...options].join(' ');
+    const regions = regionsFor(regionLines, pagesByNo);
+    // The number line was lost, and often the line of text beside it: show a little more above.
+    if (q.misnumbered === 'unreadable' && regions[0]) regions[0].y0 = Math.max(0, regions[0].y0 - 30);
     return {
       num: q.num,
       stem,
       options,
       answer: q.answer,
-      regions: regionsFor(regionLines, pagesByNo),
+      regions,
       warnings,
       score: englishScore(text),
     };
@@ -538,6 +696,21 @@ export function parseQuestions(inputPages) {
   questions = questions.filter((q) => bestByNum.get(q.num) === q);
   if (hasEnglish) questions = questions.filter((q) => q.score === null || q.score >= 0.04 || q.options.length >= 2);
   questions.sort((a, b) => a.num - b.num);
+
+  // In a paper of four-option questions, give unreadable ones four blank options: the PDF view shows the
+  // real ones and the answer can still be picked by number.
+  const counts = questions.map((q) => q.options.length).sort((a, b) => a - b);
+  const typical = counts.length ? counts[Math.floor(counts.length / 2)] : 0;
+  const unreadable = questions.filter((q) => q.options.length < 4 || q.options.some((o) => !o)).length;
+  if (typical >= 4 || unreadable > questions.length * 0.3) {
+    for (const q of questions) {
+      if (q.options.length >= 4) continue;
+      while (q.options.length < 4) q.options.push('');
+      q.warnings = q.warnings.filter((w) => !/options were found|option is empty/.test(w));
+      q.warnings.push('Some options could not be read. Check them in the PDF view.');
+    }
+  }
+  const lowTextQuality = questions.length > 0 && unreadable > questions.length * 0.3;
 
   const nums = questions.map((q) => q.num);
   const missing = [];
@@ -557,6 +730,7 @@ export function parseQuestions(inputPages) {
       missing,
       skippedPages: droppedPages,
       withWarnings: questions.filter((q) => q.warnings.length).length,
+      lowTextQuality,
     },
   };
 }

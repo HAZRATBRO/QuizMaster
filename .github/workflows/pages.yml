@@ -33,7 +33,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir _site
-          cp -r index.html css js _site/
+          cp -r index.html css js papers _site/
           touch _site/.nojekyll
 
       - uses: actions/configure-pages@v5

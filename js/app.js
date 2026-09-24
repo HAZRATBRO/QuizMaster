@@ -3,6 +3,7 @@ import { parseAnswerKey } from './answerkey.js';
 import { readPdf, registerDoc, hasDoc, openStoredDoc, drawSnippet } from './pdfview.js';
 import * as db from './store.js';
 import { analyze, scoreAttempt, hasAnswer } from './report.js';
+import { transferKey } from './match.js';
 
 const app = document.getElementById('app');
 const LETTERS = ['1', '2', '3', '4', '5'];
@@ -21,6 +22,7 @@ const state = {
   exam: { display: 'text', modal: null, paletteOpen: false },
   result: { filter: 'all' },
   setup: null,
+  catalog: [],
 };
 
 // ---------- helpers ----------
@@ -216,7 +218,8 @@ function renderLibrary() {
       ${state.importError ? `<span class="chip bad" role="alert">${esc(state.importError)}</span>` : ''}
     </label>
     <div class="lib-head"><h2>Your tests</h2><span class="muted">${quizzes.length ? plural(quizzes.length, 'test') : ''}</span></div>
-    <div class="quiz-list">${cards || '<div class="empty">No tests yet. Import a PDF above to create one.</div>'}</div>
+    <div class="quiz-list">${cards || '<div class="empty">No tests yet. Import a PDF above, or add a paper from the library below.</div>'}</div>
+    ${catalogSection()}
     ${db.storage.persistent ? '' : '<p class="muted">This browser is blocking storage, so tests will be lost when you close the page.</p>'}
   </div>`;
 
@@ -231,6 +234,67 @@ function renderLibrary() {
     const f = e.dataTransfer.files[0];
     if (f) importPdf(f);
   });
+}
+
+function catalogSection() {
+  if (!state.catalog.length) return '';
+  const cards = state.catalog.map((p) => {
+    const added = state.quizzes.find((q) => q.catalogId === p.id);
+    return `<article class="quiz-card">
+      <div>
+        <h3>${esc(p.title)}</h3>
+        <div class="quiz-meta"><span>${plural(p.questions, 'question')}</span><span>${p.keyed === p.questions ? '<span class="chip good">Answer key included</span>' : `<span class="chip warn">Key: ${p.keyed}/${p.questions}</span>`}</span></div>
+        ${p.note ? `<p class="muted" style="margin:6px 0 0;font-size:13px;max-width:70ch">${esc(p.note)}</p>` : ''}
+      </div>
+      <div class="quiz-actions">
+        ${added ? `<span class="chip accent">In your tests</span><button class="btn" data-action="setup" data-id="${added.id}">Schedule test</button>`
+          : `<button class="btn primary" data-action="add-paper" data-id="${esc(p.id)}">Add to my tests</button>`}
+      </div>
+    </article>`;
+  }).join('');
+  return `<div class="lib-head"><h2>Paper library</h2><span class="muted">Past papers, ready to take. The PDF is not included; attach yours to see the original pages.</span></div>
+    <div class="catalog">${cards}</div>`;
+}
+
+async function loadCatalog() {
+  try {
+    if (Array.isArray(window.QUIZMASTER_PAPERS)) {
+      state.catalog = window.QUIZMASTER_PAPERS.map(({ data, ...entry }) => entry);
+      return;
+    }
+    const res = await fetch('papers/index.json', { cache: 'no-cache' });
+    if (res.ok) state.catalog = await res.json();
+  } catch {
+    state.catalog = [];
+  }
+}
+
+async function addPaper(id) {
+  const entry = state.catalog.find((p) => p.id === id);
+  if (!entry) return;
+  let paper = (window.QUIZMASTER_PAPERS || []).find((p) => p.id === id)?.data;
+  if (!paper) {
+    const res = await fetch(`papers/${entry.file}`);
+    if (!res.ok) throw new Error('paper not found');
+    paper = await res.json();
+  }
+  const quiz = {
+    id: db.uid('quiz'),
+    catalogId: paper.id,
+    title: paper.title,
+    sourceName: 'Paper library',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    pageCount: paper.pageCount,
+    hasPdf: false,
+    scanned: false,
+    stats: paper.stats,
+    questions: paper.questions,
+    settings: { minutes: Math.max(5, Math.round(paper.questions.length * 0.8)), plus: 1, minus: 0.33 },
+  };
+  await saveQuiz(quiz);
+  render();
+  toast(`${paper.title} added to your tests`);
 }
 
 async function importPdf(file) {
@@ -268,6 +332,7 @@ async function importPdf(file) {
       updatedAt: Date.now(),
       pageCount: pages.length,
       hasPdf: true,
+      scanned: false,
       stats: result.stats,
       questions: result.questions,
       settings: {
@@ -276,16 +341,22 @@ async function importPdf(file) {
         minus: 0.33,
       },
     };
-    let keyFound = 0;
     if (result.keyText) {
       const key = parseAnswerKey(result.keyText);
-      for (const q of quiz.questions) if (key.has(q.num)) { q.answer = key.get(q.num); keyFound++; }
+      for (const q of quiz.questions) if (key.has(q.num)) q.answer = key.get(q.num);
     }
-    keyFound += quiz.questions.filter((q) => hasAnswer(q)).length - keyFound;
+    const keyFound = quiz.questions.filter((q) => hasAnswer(q)).length;
+    // Scanned papers: the text layer comes from text recognition, so show the page itself by default.
+    const meta = await doc.getMetadata().catch(() => null);
+    const made = `${meta?.info?.Producer || ''} ${meta?.info?.Creator || ''}`;
+    quiz.scanned = result.stats.lowTextQuality || /omnipage|abbyy|tesseract|finereader|scan|ocr/i.test(made);
+    if (quiz.scanned) quiz.settings.display = 'pdf';
+    // Same paper as a test that already has a key (another booklet series or edition)?
+    const keyOffer = keyFound ? null : findKeySource(quiz);
     await db.put('pdfs', { id: quiz.id, name: file.name, bytes: bytes.buffer });
     registerDoc(quiz.id, doc);
     await saveQuiz(quiz);
-    state.importSummary = { ...result.stats, keyFound };
+    state.importSummary = { ...result.stats, keyFound, keyOffer };
     state.importing = null;
     openEditor(quiz.id);
   } catch (err) {
@@ -296,11 +367,38 @@ async function importPdf(file) {
   }
 }
 
+/** The keyed test whose questions best match this one's, if it covers enough of them. */
+function findKeySource(quiz) {
+  let best = null;
+  for (const other of state.quizzes) {
+    if (other.id === quiz.id || !other.questions.some(hasAnswer)) continue;
+    const r = transferKey(other.questions, quiz.questions);
+    if (r.copied >= quiz.questions.length * 0.3 && (!best || r.copied > best.copied)) {
+      best = { id: other.id, title: other.title, copied: r.copied };
+    }
+  }
+  return best;
+}
+
+async function copyKeyFrom(sourceId) {
+  const quiz = state.quiz;
+  const source = state.quizzes.find((q) => q.id === sourceId);
+  if (!source) return;
+  const r = transferKey(source.questions, quiz.questions);
+  for (const q of quiz.questions) if (r.answers.has(q.id)) q.answer = r.answers.get(q.id);
+  await saveQuiz(quiz);
+  const left = quiz.questions.filter((q) => !hasAnswer(q)).map((q) => q.num);
+  state.editor.keyMsg = `Copied ${plural(r.copied, 'answer')} from "${source.title}", matching questions and options by their wording.` +
+    (left.length ? ` Still without an answer: Q${left.slice(0, 12).join(', Q')}${left.length > 12 ? ` and ${left.length - 12} more` : ''}. Use the "No answer" filter to set them.` : '');
+  if (state.importSummary) state.importSummary.keyOffer = null;
+  render();
+}
+
 // ---------- editor ----------
 
 function openEditor(id) {
   state.quiz = state.quizzes.find((q) => q.id === id);
-  state.editor = { filter: 'all', display: 'text', editing: null, confirmDeleteQ: null, keyMsg: '', confirmClear: false };
+  state.editor = { filter: 'all', display: state.quiz.scanned && state.quiz.hasPdf ? 'pdf' : 'text', editing: null, confirmDeleteQ: null, keyMsg: '', confirmClear: false, copyFrom: '' };
   state.view = 'editor';
   render();
   window.scrollTo(0, 0);
@@ -321,7 +419,7 @@ function questionCard(q, display) {
     </article>`;
   }
   const opts = q.options.map((o, i) => `<button class="opt ${q.answer === i ? 'key' : ''}" data-action="set-key" data-id="${q.id}" data-i="${i}" aria-pressed="${q.answer === i}" title="Mark option ${i + 1} as the correct answer">
-      <span class="bubble">${LETTERS[i]}</span><span>${esc(o) || '<em class="muted">(empty)</em>'}${q.answer === i ? '<span class="opt-note" style="color:var(--good)">Correct answer</span>' : ''}</span>
+      <span class="bubble">${LETTERS[i]}</span><span>${esc(o) || '<em class="muted">Could not be read. See the PDF.</em>'}${q.answer === i ? '<span class="opt-note" style="color:var(--good)">Correct answer</span>' : ''}</span>
     </button>`).join('');
   const content = display === 'pdf'
     ? `<div class="snippet" data-snippet="${q.id}"><div class="snippet-missing">Drawing from the PDF…</div></div>`
@@ -350,6 +448,7 @@ function renderEditor() {
   const flagged = quiz.questions.filter((q) => q.warnings.length).length;
   const list = quiz.questions.filter((q) => ed.filter === 'all' || (ed.filter === 'nokey' && !hasAnswer(q)) || (ed.filter === 'flag' && q.warnings.length));
   const sum = state.importSummary;
+  const keySources = state.quizzes.filter((q) => q.id !== quiz.id && q.questions.some(hasAnswer));
   const seg = (name, value, label) => `<button data-action="${name}" data-v="${value}" aria-pressed="${ed[name === 'filter' ? 'filter' : 'display'] === value}">${label}</button>`;
 
   app.innerHTML = `<div class="wrap">
@@ -362,7 +461,13 @@ function renderEditor() {
         ${sum && sum.missing && sum.missing.length ? `<span class="chip warn">Not found: Q${sum.missing.join(', Q')}</span>` : ''}
         ${flagged ? `<span class="chip warn">${plural(flagged, 'question')} to check</span>` : ''}
         ${sum && sum.keyFound ? `<span class="chip good">${sum.keyFound} answers found in the PDF</span>` : ''}
+        ${quiz.scanned ? '<span class="chip">Scanned paper: questions are shown from the PDF</span>' : ''}
       </div>
+      ${sum && sum.keyOffer ? `<div class="offer" role="status">
+        <span>This looks like the same paper as <b>${esc(sum.keyOffer.title)}</b>. ${sum.keyOffer.copied} of its answers match questions here.</span>
+        <button class="btn small primary" data-action="copy-key" data-id="${sum.keyOffer.id}">Copy those answers</button>
+        <button class="btn small ghost" data-action="dismiss-offer">No thanks</button>
+      </div>` : ''}
       ${quiz.hasPdf ? '' : `<div class="row"><span class="muted">The original PDF is not stored for this test, so only the text view is available.</span>
         <label class="btn small" style="position:relative">Attach the PDF<input type="file" id="attach-pdf" accept="application/pdf,.pdf" style="position:absolute;inset:0;opacity:0;cursor:pointer" aria-label="Attach the original PDF"></label></div>`}
     </section>
@@ -378,6 +483,11 @@ function renderEditor() {
         ${keyed ? (ed.confirmClear ? `<span class="muted">Clear all ${keyed} answers?</span><button class="btn small danger solid" data-action="clear-key">Clear</button><button class="btn small" data-action="cancel-clear">Keep</button>` : '<button class="btn small ghost danger" data-action="ask-clear">Clear key</button>') : ''}
         <span class="muted" role="status">${esc(ed.keyMsg)}</span>
       </div>
+      ${keySources.length ? `<div class="row">
+        <label for="copy-from" class="muted" style="font-size:13px">Same paper in another test?</label>
+        <select id="copy-from" class="select">${keySources.map((q) => `<option value="${q.id}">${esc(q.title)} (${q.questions.filter(hasAnswer).length} answers)</option>`).join('')}</select>
+        <button class="btn small" data-action="copy-key-select">Copy its answers</button>
+      </div>` : ''}
       <p class="muted" style="margin:0;font-size:13px">You can also click an option number on any question below to mark it as the correct answer.</p>
     </section>
 
@@ -677,7 +787,7 @@ async function enterTestTab(id) {
     state.exam = { display: quiz.hasPdf ? attempt.display || 'text' : 'text', modal: null, paletteOpen: false };
     state.view = 'exam';
   } else {
-    state.result = { filter: 'all', sort: 'order', display: 'text', timeUp: attempt.autoSubmitted };
+    state.result = { filter: 'all', sort: 'order', display: state.quiz && state.quiz.scanned && state.quiz.hasPdf ? 'pdf' : 'text', timeUp: attempt.autoSubmitted };
     state.view = 'result';
   }
   render();
@@ -788,7 +898,7 @@ function renderExam() {
   const showText = ex.display !== 'pdf';
   const showPdf = ex.display !== 'text';
   const opts = q.options.map((o, i) => `<button class="opt" role="radio" aria-checked="${resp === i}" data-action="pick" data-i="${i}">
-      <span class="bubble">${LETTERS[i]}</span><span>${showText ? esc(o) : `Option ${LETTERS[i]}`}</span></button>`).join('');
+      <span class="bubble">${LETTERS[i]}</span><span>${showText && o ? esc(o) : `Option ${LETTERS[i]}`}</span></button>`).join('');
   const legend = [
     ['done', 'Answered', c.done], ['seen', 'Not answered', c.seen], ['idle', 'Not visited', c.idle],
     ['mark', 'Marked for review', c.mark], ['markdone', 'Answered &amp; marked', c.markdone],
@@ -921,7 +1031,7 @@ async function submitExam(auto = false) {
   a.autoSubmitted = auto;
   await saveAttempt(a, true);
   if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
-  state.result = { filter: 'all', sort: 'order', display: 'text', timeUp: auto };
+  state.result = { filter: 'all', sort: 'order', display: state.quiz && state.quiz.scanned && state.quiz.hasPdf ? 'pdf' : 'text', timeUp: auto };
   state.view = 'result';
   render();
   window.scrollTo(0, 0);
@@ -933,7 +1043,7 @@ function openResult(id) {
   const a = state.attempts.find((x) => x.id === id);
   state.attempt = a;
   state.quiz = state.quizzes.find((q) => q.id === a.quizId);
-  state.result = { filter: 'all', sort: 'order', display: 'text', timeUp: false };
+  state.result = { filter: 'all', sort: 'order', display: state.quiz && state.quiz.scanned && state.quiz.hasPdf ? 'pdf' : 'text', timeUp: false };
   state.view = 'result';
   render();
   window.scrollTo(0, 0);
@@ -1006,7 +1116,7 @@ function renderResult() {
       let note = '';
       if (hasAnswer(q) && i === q.answer) { cls = 'r-correct'; note = x.resp === i ? 'Your answer · correct' : 'Correct answer'; }
       else if (x.resp === i) { cls = hasAnswer(q) ? 'r-wrong' : 'key'; note = 'Your answer'; }
-      return `<div class="opt ${cls}"><span class="bubble">${LETTERS[i]}</span><span>${esc(o)}${note ? `<span class="opt-note">${note}</span>` : ''}</span></div>`;
+      return `<div class="opt ${cls}"><span class="bubble">${LETTERS[i]}</span><span>${o ? esc(o) : `Option ${LETTERS[i]}`}${note ? `<span class="opt-note">${note}</span>` : ''}</span></div>`;
     }).join('');
     const chip = { correct: '<span class="chip good">Correct</span>', wrong: '<span class="chip bad">Wrong</span>', skipped: '<span class="chip">Not answered</span>', unscored: '<span class="chip warn">No answer key</span>' }[x.status];
     const summary = [
@@ -1161,6 +1271,7 @@ const actions = {
   edit(el) { openEditor(el.dataset.id); },
   setup(el) { openSetup(el.dataset.id); },
   'open-test'(el) { openTestTab(el.dataset.id); },
+  'add-paper'(el) { return addPaper(el.dataset.id); },
   'open-result'(el) { openResult(el.dataset.id); },
   async 'cancel-scheduled'(el) {
     await db.remove('attempts', el.dataset.id);
@@ -1184,6 +1295,9 @@ const actions = {
   },
 
   // editor
+  'copy-key'(el) { return copyKeyFrom(el.dataset.id); },
+  'copy-key-select'() { return copyKeyFrom(document.getElementById('copy-from').value); },
+  'dismiss-offer'() { state.importSummary.keyOffer = null; render(); },
   filter(el) { state.editor.filter = el.dataset.v; render(); },
   display(el) { state.editor.display = el.dataset.v; render(); },
   async 'set-key'(el) {
@@ -1434,10 +1548,7 @@ async function boot() {
   } catch (err) {
     console.error(err);
   }
-  if (!state.quizzes.length && window.QUIZMASTER_SAMPLE) {
-    const sample = window.QUIZMASTER_SAMPLE;
-    await saveQuiz({ ...sample, id: db.uid('quiz'), createdAt: Date.now(), updatedAt: Date.now(), hasPdf: false });
-  }
+  await loadCatalog();
   await reloadLibrary();
 }
 

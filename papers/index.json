@@ -1,0 +1,20 @@
+[
+  {
+    "id": "uppsc-2025-gs1-pw",
+    "title": "UPPSC Prelims 2025 · GS Paper I",
+    "note": "Held 12 October 2025. Question order of the Physics Wallah (UPPSC Wallah) edition, with its answer key.",
+    "file": "uppsc-2025-gs1-pw.json",
+    "questions": 150,
+    "keyed": 150,
+    "keySource": "answer key printed in the PDF"
+  },
+  {
+    "id": "uppsc-2025-gs1-drishti",
+    "title": "UPPSC Prelims 2025 · GS Paper I (Drishti order)",
+    "note": "The same paper in the question order of the Drishti IAS edition. Answers copied from the Physics Wallah key; 5 questions whose options did not match exactly are left for you to set.",
+    "file": "uppsc-2025-gs1-drishti.json",
+    "questions": 150,
+    "keyed": 145,
+    "keySource": "copied from \"UPPSC Prelims 2025 · GS Paper I\" by matching question wording"
+  }
+]

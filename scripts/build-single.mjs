@@ -1,7 +1,6 @@
 // Bundles the app into one self-contained HTML file (CSS and JS inlined; pdf.js still loads from the CDN).
-// Usage: node scripts/build-single.mjs [out.html] [--fragment] [--sample quiz.json]
+// Usage: node scripts/build-single.mjs [out.html] [--fragment]
 //   --fragment  omit <!doctype>/<html>/<head>/<body> for hosts that supply their own skeleton
-//   --sample    preload a parsed quiz (from scripts/parse-pdf.mjs --json) on first open
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,10 +10,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(name);
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
-const out = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--sample') || path.join(root, 'dist/quizmaster.html');
+const out = args.find((a) => !a.startsWith('--')) || path.join(root, 'dist/quizmaster.html');
 
 // Modules in dependency order.
-const modules = ['parser.js', 'extract.js', 'answerkey.js', 'report.js', 'store.js', 'pdfview.js', 'app.js'];
+const modules = ['parser.js', 'extract.js', 'answerkey.js', 'report.js', 'match.js', 'store.js', 'pdfview.js', 'app.js'];
 const ident = (file) => `__mod_${file.replace(/\W/g, '_')}`;
 
 const chunks = modules.map((file) => {
@@ -32,20 +31,16 @@ const chunks = modules.map((file) => {
 });
 
 const css = fs.readFileSync(path.join(root, 'css/styles.css'), 'utf8');
-const sample = opt('--sample');
-const sampleJs = sample
-  ? (() => {
-      const parsed = JSON.parse(fs.readFileSync(sample, 'utf8'));
-      const quiz = {
-        title: opt('--title') || 'Sample paper',
-        sourceName: opt('--source') || path.basename(sample),
-        pageCount: parsed.stats.pages,
-        stats: parsed.stats,
-        questions: parsed.questions,
-        settings: { minutes: Math.max(5, Math.round(parsed.questions.length * 0.8)), plus: 1, minus: 0.33 },
-      };
-      return `<script>window.QUIZMASTER_SAMPLE = ${JSON.stringify(quiz).replace(/</g, '\\u003c')};</script>\n`;
-    })()
+// The paper library is embedded, since a single file cannot fetch papers/*.json next to it.
+const papersDir = path.join(root, 'papers');
+const papers = fs.existsSync(path.join(papersDir, 'index.json'))
+  ? JSON.parse(fs.readFileSync(path.join(papersDir, 'index.json'), 'utf8')).map((entry) => ({
+      ...entry,
+      data: JSON.parse(fs.readFileSync(path.join(papersDir, entry.file), 'utf8')),
+    }))
+  : [];
+const papersJs = papers.length
+  ? `<script>window.QUIZMASTER_PAPERS = ${JSON.stringify(papers).replace(/</g, '\\u003c')};</script>\n`
   : '';
 
 const head = `<title>QuizMaster</title>
@@ -56,7 +51,7 @@ const head = `<title>QuizMaster</title>
 ${css}
 </style>`;
 const body = `<div id="app"><div class="wrap"><p class="muted">Loading QuizMaster…</p></div></div>
-${sampleJs}<script type="module">
+${papersJs}<script type="module">
 ${chunks.join('\n\n')}
 </script>`;
 
