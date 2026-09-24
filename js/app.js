@@ -2,6 +2,7 @@ import { parseQuestions } from './parser.js';
 import { parseAnswerKey } from './answerkey.js';
 import { readPdf, registerDoc, hasDoc, openStoredDoc, drawSnippet } from './pdfview.js';
 import * as db from './store.js';
+import { analyze, scoreAttempt, hasAnswer } from './report.js';
 
 const app = document.getElementById('app');
 const LETTERS = ['1', '2', '3', '4', '5'];
@@ -25,10 +26,8 @@ const state = {
 // ---------- helpers ----------
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-const hasAnswer = (q) => q.answer !== null && q.answer !== undefined;
 const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
 const fmtDate = (t) => new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
-const round2 = (n) => Math.round(n * 100) / 100;
 
 function fmtClock(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -101,8 +100,9 @@ async function saveQuiz(quiz) {
   else state.quizzes.unshift(quiz);
 }
 
-async function saveAttempt(attempt) {
+async function saveAttempt(attempt, notify = false) {
   await db.put('attempts', attempt);
+  if (notify) broadcast(attempt.id);
   const i = state.attempts.findIndex((a) => a.id === attempt.id);
   if (i >= 0) state.attempts[i] = attempt;
   else state.attempts.unshift(attempt);
@@ -147,42 +147,13 @@ function hydrateSnippets(root = app) {
   els.forEach((el) => io.observe(el));
 }
 
-// ---------- scoring ----------
-
-function scoreAttempt(quiz, attempt) {
-  const byId = new Map(quiz.questions.map((q) => [q.id, q]));
-  const plus = attempt.settings.plus;
-  const minus = attempt.settings.minus;
-  const rows = [];
-  let correct = 0, wrong = 0, skipped = 0, unscored = 0;
-  for (const qid of attempt.order) {
-    const q = byId.get(qid);
-    if (!q) continue;
-    const resp = attempt.responses[qid];
-    const answered = resp !== undefined && resp !== null;
-    let status;
-    if (!hasAnswer(q)) { status = 'unscored'; unscored++; }
-    else if (!answered) { status = 'skipped'; skipped++; }
-    else if (resp === q.answer) { status = 'correct'; correct++; }
-    else { status = 'wrong'; wrong++; }
-    rows.push({ q, resp: answered ? resp : null, status, marked: !!attempt.marked[qid] });
-  }
-  const scored = correct + wrong + skipped;
-  return {
-    rows, correct, wrong, skipped, unscored,
-    score: round2(correct * plus - wrong * minus),
-    max: round2(scored * plus),
-    accuracy: correct + wrong ? Math.round((correct / (correct + wrong)) * 100) : null,
-    attempted: rows.filter((r) => r.resp !== null).length,
-  };
-}
-
 // ---------- rendering ----------
 
 function render() {
   clearInterval(state.timerHandle);
   document.body.classList.toggle('in-exam', state.view === 'exam');
   if (state.view === 'library') renderLibrary();
+  else if (state.view === 'lobby') renderLobby();
   else if (state.view === 'editor') renderEditor();
   else if (state.view === 'setup') renderSetup();
   else if (state.view === 'exam') renderExam();
@@ -203,6 +174,7 @@ function renderLibrary() {
     const keyed = quiz.questions.filter(hasAnswer).length;
     const attempts = state.attempts.filter((a) => a.quizId === quiz.id);
     const live = attempts.find((a) => a.status === 'in-progress');
+    const upcoming = attempts.filter((a) => a.status === 'scheduled').sort((a, b) => (a.startsAt || 0) - (b.startsAt || 0));
     const done = attempts.filter((a) => a.status === 'submitted').sort((a, b) => b.submittedAt - a.submittedAt);
     const confirming = state.confirmDelete === quiz.id;
     const strip = done.slice(0, 4).map((a) => {
@@ -222,10 +194,13 @@ function renderLibrary() {
         ${confirming ? `<span class="muted">Delete this test and its attempts?</span>
           <button class="btn small danger solid" data-action="delete-quiz" data-id="${quiz.id}">Delete</button>
           <button class="btn small" data-action="cancel-delete">Keep</button>` : `
-          ${live ? `<button class="btn primary" data-action="resume" data-id="${live.id}">Resume test</button>` : `<button class="btn primary" data-action="setup" data-id="${quiz.id}">Start test</button>`}
+          ${live ? `<button class="btn primary" data-action="open-test" data-id="${live.id}">Resume test</button>` : `<button class="btn primary" data-action="setup" data-id="${quiz.id}">Schedule test</button>`}
           <button class="btn" data-action="edit" data-id="${quiz.id}">Questions &amp; key</button>
           <button class="btn ghost danger" data-action="ask-delete" data-id="${quiz.id}" aria-label="Delete ${esc(quiz.title)}">Delete</button>`}
       </div>
+      ${live ? `<div class="attempt-strip"><span class="chip accent">In progress</span><span class="muted">Ends ${esc(fmtWhen(live.endsAt))}. It keeps running in its own tab.</span></div>` : ''}
+      ${upcoming.map((a) => `<div class="attempt-strip"><span class="chip">Scheduled</span><span class="muted">${a.startsAt ? `Starts ${esc(fmtWhen(a.startsAt))}` : 'Waiting for you to start'} · ${fmtDuration(a.durationSec)} · ${plural(a.order.length, 'question')}</span>
+        <button data-action="open-test" data-id="${a.id}">Open test tab</button><button data-action="cancel-scheduled" data-id="${a.id}">Cancel</button></div>`).join('')}
       ${strip ? `<div class="attempt-strip"><span class="muted">Past attempts:</span>${strip}</div>` : ''}
     </article>`;
   }).join('');
@@ -378,7 +353,7 @@ function renderEditor() {
   const seg = (name, value, label) => `<button data-action="${name}" data-v="${value}" aria-pressed="${ed[name === 'filter' ? 'filter' : 'display'] === value}">${label}</button>`;
 
   app.innerHTML = `<div class="wrap">
-    ${topbar(`<button class="btn" data-action="home">All tests</button><button class="btn primary" data-action="setup" data-id="${quiz.id}">Start test</button>`)}
+    ${topbar(`<button class="btn" data-action="home">All tests</button><button class="btn primary" data-action="setup" data-id="${quiz.id}">Schedule test</button>`)}
     <section class="editor-head">
       <input class="title-input" id="quiz-title" value="${esc(quiz.title)}" aria-label="Test name">
       <div class="summary-bar">
@@ -503,16 +478,30 @@ async function loadKeyFile(file) {
   }
 }
 
-// ---------- setup ----------
+// ---------- scheduling ----------
+
+function localInputValue(t) {
+  const d = new Date(t);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function fmtWhen(t) {
+  return new Date(t).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+
+const testUrl = (id) => `${location.pathname}${location.search}#test-${id}`;
 
 function openSetup(id) {
   state.quiz = state.quizzes.find((q) => q.id === id);
   const s = state.quiz.settings;
   const nums = state.quiz.questions.map((q) => q.num);
+  const inAnHour = Math.ceil((Date.now() + 3600000) / 900000) * 900000;
   state.setup = {
     minutes: s.minutes, plus: s.plus, minus: s.minus, shuffle: false,
     from: Math.min(...nums), to: Math.max(...nums),
     display: s.display && (s.display === 'text' || state.quiz.hasPdf) ? s.display : 'text',
+    when: 'now', at: localInputValue(inAnHour), error: '',
   };
   state.view = 'setup';
   render();
@@ -529,12 +518,18 @@ function renderSetup() {
   const s = state.setup;
   const picked = setupSelection();
   const noKey = picked.filter((q) => !hasAnswer(q)).length;
-  const dispBtn = (v, label, disabled) => `<button data-action="setup-display" data-v="${v}" aria-pressed="${s.display === v}" ${disabled ? 'disabled title="The PDF is not stored for this test"' : ''}>${label}</button>`;
+  const dispBtn = (v, label, disabled) => `<button type="button" data-action="setup-display" data-v="${v}" aria-pressed="${s.display === v}" ${disabled ? 'disabled title="The PDF is not stored for this test"' : ''}>${label}</button>`;
   app.innerHTML = `<div class="wrap">
     ${topbar(`<button class="btn" data-action="edit" data-id="${quiz.id}">Questions &amp; key</button><button class="btn" data-action="home">All tests</button>`)}
     <form class="setup" data-form="start">
-      <div><span class="eyebrow">Test settings</span><h2 style="font-size:24px;margin-top:4px">${esc(quiz.title)}</h2></div>
+      <div><span class="eyebrow">Schedule a test</span><h2 style="font-size:24px;margin-top:4px">${esc(quiz.title)}</h2></div>
       <div class="panel stack">
+        <div class="field"><span>When</span>
+          <label class="check"><input type="radio" name="when" value="now" id="when-now" ${s.when === 'now' ? 'checked' : ''}> Start when I'm ready</label>
+          <label class="check"><input type="radio" name="when" value="later" id="when-later" ${s.when === 'later' ? 'checked' : ''}> Start at a set time</label>
+          ${s.when === 'later' ? `<input type="datetime-local" id="set-at" name="at" value="${esc(s.at)}" min="${localInputValue(Date.now())}" style="max-width:260px;border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:var(--surface)">
+            <small>Keep the test tab open. It starts on its own at that time.</small>` : '<small>The test opens in a new tab with its instructions. The timer starts when you press Start.</small>'}
+        </div>
         <label class="field"><span>Time limit (minutes)</span>
           <input type="number" id="set-minutes" name="minutes" min="1" max="600" value="${s.minutes}" required>
         </label>
@@ -557,8 +552,9 @@ function renderSetup() {
           <small>You can switch this during the test too.</small>
         </div>
       </div>
-      <p class="muted" style="margin:0">${plural(picked.length, 'question')} in ${fmtDuration(s.minutes * 60)}.${noKey ? ` ${plural(noKey, 'question has', 'questions have')} no answer yet and will show as unscored. You can add the key later and the result updates.` : ''}</p>
-      <div class="row"><button class="btn primary" type="submit" ${picked.length ? '' : 'disabled'}>Start the test</button><button class="btn" type="button" data-action="edit" data-id="${quiz.id}">Back</button></div>
+      <p class="muted" style="margin:0">${plural(picked.length, 'question')} in ${fmtDuration(s.minutes * 60)}.${noKey ? ` ${plural(noKey, 'question has', 'questions have')} no answer yet and will show as unscored. Add the key later and the report updates.` : ''}</p>
+      ${s.error ? `<span class="chip bad" role="alert">${esc(s.error)}</span>` : ''}
+      <div class="row"><button class="btn primary" type="submit" ${picked.length ? '' : 'disabled'}>${s.when === 'later' ? 'Schedule and open the test tab' : 'Open the test in a new tab'}</button><button class="btn" type="button" data-action="edit" data-id="${quiz.id}">Back</button></div>
     </form>
   </div>`;
   const form = app.querySelector('[data-form="start"]');
@@ -571,6 +567,8 @@ function renderSetup() {
       from: +f.get('from'),
       to: +f.get('to'),
       shuffle: f.get('shuffle') === 'on',
+      when: f.get('when') || 'now',
+      at: f.get('at') || s.at,
     });
   });
   form.addEventListener('change', () => {
@@ -580,48 +578,186 @@ function renderSetup() {
   });
 }
 
-async function startExam() {
+/** Runs inside the submit handler: the new tab must be opened before any await to count as a click. */
+function scheduleTest() {
   const quiz = state.quiz;
   const s = state.setup;
-  const picked = setupSelection();
-  const order = picked.map((q) => q.id);
+  const startsAt = s.when === 'later' ? new Date(s.at).getTime() : null;
+  if (s.when === 'later' && (!startsAt || startsAt < Date.now() - 60000)) {
+    s.error = 'Pick a start time in the future.';
+    render();
+    return;
+  }
+  s.error = '';
+  const tab = db.storage.persistent ? window.open('', '_blank') : null;
+  const order = setupSelection().map((q) => q.id);
   if (s.shuffle) {
     for (let i = order.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [order[i], order[j]] = [order[j], order[i]];
     }
   }
-  quiz.settings = { ...quiz.settings, minutes: s.minutes, plus: s.plus, minus: s.minus, display: s.display };
-  await saveQuiz(quiz);
-  const now = Date.now();
   const attempt = {
     id: db.uid('att'),
     quizId: quiz.id,
-    status: 'in-progress',
-    startedAt: now,
-    endsAt: now + s.minutes * 60000,
+    status: 'scheduled',
+    createdAt: Date.now(),
+    startsAt,
     durationSec: s.minutes * 60,
     order,
     responses: {},
     marked: {},
     visited: {},
+    timeSpent: {},
+    changes: {},
     current: 0,
+    display: s.display,
     settings: { plus: s.plus, minus: s.minus },
   };
-  await saveAttempt(attempt);
-  openExam(attempt, s.display);
+  quiz.settings = { ...quiz.settings, minutes: s.minutes, plus: s.plus, minus: s.minus, display: s.display };
+  (async () => {
+    await saveQuiz(quiz);
+    await saveAttempt(attempt, true);
+    if (tab && !tab.closed) {
+      tab.location.href = new URL(testUrl(attempt.id), location.href).href;
+      state.view = 'library';
+      render();
+      toast(startsAt ? `Test scheduled for ${fmtWhen(startsAt)}` : 'Test opened in a new tab');
+    } else {
+      // Pop-ups blocked (or no shared storage): run the test in this tab instead.
+      if (tab) tab.close();
+      location.hash = `test-${attempt.id}`;
+      enterTestTab(attempt.id);
+    }
+  })().catch((err) => {
+    console.error(err);
+    if (tab) tab.close();
+    toast('The test could not be created. Try again.');
+  });
 }
 
-// ---------- exam ----------
+function openTestTab(id) {
+  const tab = window.open(testUrl(id), '_blank');
+  if (!tab) {
+    location.hash = `test-${id}`;
+    enterTestTab(id);
+  }
+}
 
-function openExam(attempt, display) {
+// ---------- the test tab ----------
+
+async function enterTestTab(id) {
+  state.testTab = id;
+  document.body.classList.add('test-tab');
+  let attempt = null;
+  for (let i = 0; i < 15 && !attempt; i++) {
+    attempt = await db.get('attempts', id);
+    if (!attempt) await new Promise((r) => setTimeout(r, 200));
+  }
+  const quiz = attempt && (await db.get('quizzes', attempt.quizId));
+  if (!attempt || !quiz) {
+    app.innerHTML = `<div class="wrap"><div class="empty">This test could not be found. It may have been deleted, or it was created in another browser.<br><br><a class="btn" href="${location.pathname}${location.search}">Open QuizMaster</a></div></div>`;
+    return;
+  }
+  const i = state.quizzes.findIndex((q) => q.id === quiz.id);
+  if (i >= 0) state.quizzes[i] = quiz;
+  else state.quizzes.push(quiz);
+  if (!state.attempts.some((a) => a.id === attempt.id)) state.attempts.push(attempt);
+  state.attempts = state.attempts.map((a) => (a.id === attempt.id ? attempt : a));
+  state.quiz = quiz;
   state.attempt = attempt;
-  state.quiz = state.quizzes.find((q) => q.id === attempt.quizId);
-  const pref = display || state.quiz.settings.display || 'text';
-  state.exam = { display: state.quiz.hasPdf ? pref : 'text', modal: null, paletteOpen: false };
+  attempt.timeSpent ||= {};
+  attempt.changes ||= {};
+  document.title = `${quiz.title} · Test`;
+  if (attempt.status === 'in-progress' && attempt.endsAt <= Date.now()) await finishExpired(attempt);
+  if (attempt.status === 'scheduled') {
+    state.view = 'lobby';
+    state.lobby = { fullscreen: true };
+  } else if (attempt.status === 'in-progress') {
+    state.exam = { display: quiz.hasPdf ? attempt.display || 'text' : 'text', modal: null, paletteOpen: false };
+    state.view = 'exam';
+  } else {
+    state.result = { filter: 'all', sort: 'order', display: 'text', timeUp: attempt.autoSubmitted };
+    state.view = 'result';
+  }
+  render();
+}
+
+function renderLobby() {
+  const a = state.attempt;
+  const quiz = state.quiz;
+  const n = a.order.length;
+  const keyed = a.order.filter((id) => hasAnswer(quiz.questions.find((q) => q.id === id) || {})).length;
+  const waiting = a.startsAt && a.startsAt > Date.now();
+  app.innerHTML = `<div class="wrap lobby">
+    <span class="eyebrow">Test instructions</span>
+    <h1 class="lobby-title">${esc(quiz.title)}</h1>
+    <div class="facts">
+      <div><span>Questions</span><b>${n}</b></div>
+      <div><span>Time limit</span><b>${fmtDuration(a.durationSec)}</b></div>
+      <div><span>Correct answer</span><b>+${a.settings.plus}</b></div>
+      <div><span>Wrong answer</span><b>−${a.settings.minus}</b></div>
+    </div>
+    ${waiting ? `<div class="countdown" role="timer" aria-live="off">
+        <span class="eyebrow">Starts ${esc(fmtWhen(a.startsAt))}</span>
+        <b id="lobby-count">${fmtClock((a.startsAt - Date.now()) / 1000)}</b>
+        <span class="muted">Keep this tab open. The test starts on its own when the countdown ends.</span>
+      </div>` : ''}
+    <section class="panel instructions">
+      <h2>Before you start</h2>
+      <ol>
+        <li>The timer starts when the test starts and cannot be paused. When it reaches zero, the test is submitted on its own.</li>
+        <li>Click an option to select it. Click it again, or use <b>Clear response</b>, to unselect.</li>
+        <li><b>Save &amp; next</b> moves on. <b>Mark for review &amp; next</b> flags the question so you can come back. Marked answers still count.</li>
+        <li>Each wrong answer costs ${a.settings.minus} marks. Unanswered questions cost nothing.</li>
+        <li>Keys: <kbd>1</kbd>–<kbd>4</kbd> choose, <kbd>C</kbd> clear, <kbd>M</kbd> mark for review, <kbd>←</kbd> <kbd>→</kbd> previous and next.</li>
+      </ol>
+      <div class="legend lobby-legend">
+        <div><span class="swatch st-idle"></span>Not visited</div>
+        <div><span class="swatch st-seen"></span>Not answered</div>
+        <div><span class="swatch st-done"></span>Answered</div>
+        <div><span class="swatch st-mark"></span>Marked for review</div>
+        <div><span class="swatch st-markdone"></span>Answered and marked</div>
+      </div>
+      ${keyed < n ? `<p class="muted" style="margin:0">${plural(n - keyed, 'question has', 'questions have')} no answer key yet and won't be scored until one is added.</p>` : ''}
+    </section>
+    <label class="check"><input type="checkbox" id="lobby-fs" ${state.lobby.fullscreen ? 'checked' : ''}> Use full screen during the test</label>
+    <div class="row">
+      <button class="btn primary big" data-action="start-test">${waiting ? 'Start now instead' : 'Start the test'}</button>
+      <a class="btn" href="${location.pathname}${location.search}">Back to QuizMaster</a>
+    </div>
+  </div>`;
+  document.getElementById('lobby-fs').addEventListener('change', (e) => (state.lobby.fullscreen = e.target.checked));
+  if (waiting) state.timerHandle = setInterval(lobbyTick, 500);
+}
+
+function lobbyTick() {
+  const a = state.attempt;
+  const left = (a.startsAt - Date.now()) / 1000;
+  const el = document.getElementById('lobby-count');
+  if (el) el.textContent = fmtClock(left);
+  if (left <= 0) startTest(false);
+}
+
+async function startTest(fromClick) {
+  const a = state.attempt;
+  if (a.status !== 'scheduled') return;
+  clearInterval(state.timerHandle);
+  if (fromClick && state.lobby.fullscreen && document.documentElement.requestFullscreen) {
+    document.documentElement.requestFullscreen().catch(() => {});
+  }
+  const now = Date.now();
+  a.status = 'in-progress';
+  a.startedAt = now;
+  a.endsAt = now + a.durationSec * 1000;
+  await saveAttempt(a, true);
+  state.exam = { display: state.quiz.hasPdf ? a.display || 'text' : 'text', modal: null, paletteOpen: false };
+  state.lastTick = null;
   state.view = 'exam';
   render();
 }
+
+// ---------- exam ----------
 
 function paletteStatus(a, qid) {
   const ans = a.responses[qid] !== undefined;
@@ -673,12 +809,12 @@ function renderExam() {
           <tr><td>Time left</td><td id="modal-time">${fmtClock((a.endsAt - Date.now()) / 1000)}</td></tr>
         </table>
         <p class="muted" style="margin:0">Answers marked for review are still counted. You cannot change answers after submitting.</p>
-        <div class="row"><button class="btn primary" data-action="confirm-submit">Submit</button><button class="btn" data-action="close-modal">Back to the test</button></div>
+        <div class="row"><button class="btn primary" data-action="confirm-submit">Submit and see my report</button><button class="btn" data-action="close-modal">Back to the test</button></div>
       </div>
     </div>` : ex.modal === 'quit' ? `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="quit-h">
       <div class="modal">
         <h2 id="quit-h">Leave the test?</h2>
-        <p class="muted" style="margin:0">Your answers are saved and the timer keeps running. Resume it from your tests list.</p>
+        <p class="muted" style="margin:0">Your answers are saved but the timer keeps running. Reopen the test from your tests list to carry on.</p>
         <div class="row"><button class="btn" data-action="leave-exam">Leave</button><button class="btn primary" data-action="close-modal">Stay</button></div>
       </div>
     </div>` : '';
@@ -696,7 +832,7 @@ function renderExam() {
         <div class="q-inner">
           <div class="q-top">
             <h2>Question ${q.num} <span class="muted" style="font-weight:400">· ${a.current + 1} of ${a.order.length}</span></h2>
-            ${a.marked[qid] ? '<span class="chip" style="background:var(--review-soft);color:var(--review);border-color:transparent">Marked for review</span><button class="btn small ghost" data-action="unmark">Unmark</button>' : ''}
+            ${a.marked[qid] ? '<span class="chip review">Marked for review</span><button class="btn small ghost" data-action="unmark">Unmark</button>' : ''}
             ${quiz.hasPdf ? `<div class="seg" role="group" aria-label="Question display">
               ${['text', 'pdf', 'both'].map((v) => `<button data-action="exam-display" data-v="${v}" aria-pressed="${ex.display === v}">${v === 'text' ? 'Text' : v === 'pdf' ? 'PDF' : 'Both'}</button>`).join('')}
             </div>` : ''}
@@ -735,8 +871,19 @@ function renderExam() {
 
 function tick() {
   const a = state.attempt;
-  if (!a || state.view !== 'exam') return;
-  const left = (a.endsAt - Date.now()) / 1000;
+  if (!a || state.view !== 'exam' || a.status !== 'in-progress') return;
+  const now = Date.now();
+  // Time on the question that is on screen.
+  if (state.lastTick) {
+    const qid = a.order[a.current];
+    a.timeSpent[qid] = (a.timeSpent[qid] || 0) + Math.min(5, (now - state.lastTick) / 1000);
+  }
+  state.lastTick = now;
+  if (!state.lastSave || now - state.lastSave > 5000) {
+    state.lastSave = now;
+    saveAttempt(a);
+  }
+  const left = (a.endsAt - now) / 1000;
   const el = document.getElementById('timer');
   if (el) {
     el.textContent = fmtClock(left);
@@ -756,6 +903,14 @@ function go(delta) {
   return true;
 }
 
+async function finishExpired(a) {
+  a.status = 'submitted';
+  a.submittedAt = a.endsAt;
+  a.timeUsedSec = a.durationSec;
+  a.autoSubmitted = true;
+  await saveAttempt(a, true);
+}
+
 async function submitExam(auto = false) {
   const a = state.attempt;
   if (!a || a.status !== 'in-progress') return;
@@ -764,91 +919,239 @@ async function submitExam(auto = false) {
   a.submittedAt = Math.min(Date.now(), a.endsAt);
   a.timeUsedSec = Math.round((a.submittedAt - a.startedAt) / 1000);
   a.autoSubmitted = auto;
-  await saveAttempt(a);
-  state.result = { filter: 'all', timeUp: auto };
+  await saveAttempt(a, true);
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  state.result = { filter: 'all', sort: 'order', display: 'text', timeUp: auto };
   state.view = 'result';
   render();
   window.scrollTo(0, 0);
 }
 
-// ---------- results ----------
+// ---------- performance report ----------
 
 function openResult(id) {
   const a = state.attempts.find((x) => x.id === id);
   state.attempt = a;
   state.quiz = state.quizzes.find((q) => q.id === a.quizId);
-  state.result = { filter: 'all' };
+  state.result = { filter: 'all', sort: 'order', display: 'text', timeUp: false };
   state.view = 'result';
   render();
   window.scrollTo(0, 0);
 }
 
+const STATUS_LABEL = { correct: 'Correct', wrong: 'Wrong', skipped: 'Not answered', unscored: 'No answer key' };
+
+function timeChart(r) {
+  const rows = r.rows;
+  const max = Math.max(60, r.time.maxTime);
+  const step = max <= 120 ? 30 : max <= 300 ? 60 : max <= 900 ? 180 : 300;
+  const top = Math.ceil(max / step) * step;
+  const ticks = [0, top / 2, top];
+  const every = rows.length > 60 ? 25 : rows.length > 20 ? 10 : 5;
+  const bars = rows.map((x) => {
+    const tip = `Q${x.q.num} · ${fmtClock(x.time)} · ${STATUS_LABEL[x.status]}`;
+    return `<button class="tbar" data-action="goto-q" data-id="${x.q.id}" data-tip="${esc(tip)}" aria-label="${esc(tip)}"><i class="s-${x.status}" style="height:${(x.time / top) * 100}%"></i></button>`;
+  }).join('');
+  const labels = rows.map((x, i) => `<span>${i === 0 || (i + 1) % every === 0 ? x.q.num : ''}</span>`).join('');
+  const present = ['correct', 'wrong', 'skipped', 'unscored'].filter((k) => rows.some((x) => x.status === k));
+  return `<div class="tchart">
+    <div class="legend-row">${present.map((k) => `<span><i class="key s-${k}"></i>${STATUS_LABEL[k]}</span>`).join('')}</div>
+    <div class="tchart-body">
+      <div class="tchart-y">${ticks.slice().reverse().map((t) => `<span>${fmtClock(t)}</span>`).join('')}</div>
+      <div class="tchart-plot">
+        ${ticks.map((t) => `<div class="grid" style="bottom:${(t / top) * 100}%"></div>`).join('')}
+        <div class="tbars">${bars}</div>
+        <div class="tip" hidden></div>
+      </div>
+    </div>
+    <div class="tchart-x">${labels}</div>
+  </div>`;
+}
+
+function typeTable(r) {
+  const rows = r.byType.map((t) => {
+    const seg = (k) => (t[k] ? `<i class="s-${k}" style="flex:${t[k]}" title="${t[k]} ${STATUS_LABEL[k].toLowerCase()}"></i>` : '');
+    return `<tr>
+      <td>${esc(t.type)}</td>
+      <td class="n">${t.total}</td>
+      <td class="n">${t.correct}</td>
+      <td class="n">${t.wrong}</td>
+      <td class="n">${t.skipped}</td>
+      <td class="n">${t.accuracy === null ? '–' : `${t.accuracy}%`}</td>
+      ${r.time.tracked ? `<td class="n">${fmtClock(t.avgTime)}</td>` : ''}
+      <td class="stackcell"><div class="stack-bar">${seg('correct')}${seg('wrong')}${seg('skipped')}${seg('unscored')}</div></td>
+    </tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table class="data">
+    <thead><tr><th>Question type</th><th class="n">Questions</th><th class="n">Correct</th><th class="n">Wrong</th><th class="n">Not answered</th><th class="n">Accuracy</th>${r.time.tracked ? '<th class="n">Avg time</th>' : ''}<th>Split</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
 function renderResult() {
   const a = state.attempt;
   const quiz = state.quiz;
-  const r = scoreAttempt(quiz, a);
-  const f = state.result.filter;
+  const history = state.attempts.filter((x) => x.quizId === quiz.id);
+  const r = analyze(quiz, a, history);
+  const res = state.result;
+  const f = res.filter;
   const total = r.rows.length;
-  const pct = (n) => `${total ? (n / total) * 100 : 0}%`;
-  const rows = r.rows.filter((x) => f === 'all' || x.status === f || (f === 'marked' && x.marked));
+  let rows = r.rows.filter((x) => f === 'all' || x.status === f || (f === 'marked' && x.marked) || (f === 'changed' && x.changes > 0));
+  if (res.sort === 'slowest') rows = [...rows].sort((x, y) => y.time - x.time);
+  const showPdf = res.display === 'pdf' && quiz.hasPdf;
   const list = rows.map((x) => {
     const q = x.q;
     const opts = q.options.map((o, i) => {
       let cls = '';
       let note = '';
-      if (hasAnswer(q) && i === q.answer) { cls = 'r-correct'; note = x.resp === i ? 'Your answer, correct' : 'Correct answer'; }
+      if (hasAnswer(q) && i === q.answer) { cls = 'r-correct'; note = x.resp === i ? 'Your answer · correct' : 'Correct answer'; }
       else if (x.resp === i) { cls = hasAnswer(q) ? 'r-wrong' : 'key'; note = 'Your answer'; }
       return `<div class="opt ${cls}"><span class="bubble">${LETTERS[i]}</span><span>${esc(o)}${note ? `<span class="opt-note">${note}</span>` : ''}</span></div>`;
     }).join('');
     const chip = { correct: '<span class="chip good">Correct</span>', wrong: '<span class="chip bad">Wrong</span>', skipped: '<span class="chip">Not answered</span>', unscored: '<span class="chip warn">No answer key</span>' }[x.status];
-    return `<article class="qcard">
-      <div class="qcard-head"><span class="qno">Q${q.num}</span>${chip}${x.marked ? '<span class="chip" style="background:var(--review-soft);color:var(--review);border-color:transparent">Marked</span>' : ''}</div>
-      <div class="q-body">${stemHtml(q)}</div>
+    const summary = [
+      x.resp !== null ? `You chose ${x.resp + 1}` : 'You did not answer',
+      hasAnswer(q) ? `correct answer ${q.answer + 1}` : null,
+      r.time.tracked ? `${fmtClock(x.time)} spent` : null,
+      x.changes ? `answer changed ${plural(x.changes, 'time')}` : null,
+    ].filter(Boolean).join(' · ');
+    return `<article class="qcard" id="rev-${q.id}">
+      <div class="qcard-head"><span class="qno">Q${q.num}</span>${chip}${x.marked ? '<span class="chip review">Marked</span>' : ''}<span class="chip">${esc(x.type)}</span></div>
+      <div class="muted rev-sum">${summary}</div>
+      ${showPdf ? `<div class="snippet" data-snippet="${q.id}"><div class="snippet-missing">Drawing from the PDF…</div></div>` : `<div class="q-body">${stemHtml(q)}</div>`}
       <div class="opts">${opts}</div>
     </article>`;
   }).join('');
   const seg = (v, label) => `<button data-action="result-filter" data-v="${v}" aria-pressed="${f === v}">${label}</button>`;
   const markedCount = r.rows.filter((x) => x.marked).length;
+  const changedCount = r.rows.filter((x) => x.changes > 0).length;
+  const back = state.testTab
+    ? `<button class="btn" data-action="close-tab">Close this tab</button><a class="btn primary" href="${location.pathname}${location.search}">Open QuizMaster</a>`
+    : '<button class="btn" data-action="home">All tests</button>';
+  const t = r.time;
+  const past = r.past.length > 1 ? `<section class="panel stack">
+      <h2 class="h-sec">Your attempts at this test</h2>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>Date</th><th class="n">Score</th><th class="n">Accuracy</th><th class="n">Attempted</th><th class="n">Time used</th></tr></thead>
+        <tbody>${r.past.map((p) => `<tr class="${p.current ? 'current' : ''}"><td>${fmtWhen(p.at)}${p.current ? ' <span class="chip accent">This attempt</span>' : ''}</td><td class="n">${p.score} / ${p.max}</td><td class="n">${p.accuracy === null ? '–' : `${p.accuracy}%`}</td><td class="n">${p.attempted}</td><td class="n">${p.timeUsed ? fmtDuration(p.timeUsed) : '–'}</td></tr>`).join('')}</tbody>
+      </table></div>
+    </section>` : '';
 
-  app.innerHTML = `<div class="wrap">
-    ${topbar(`<button class="btn" data-action="home">All tests</button>`)}
+  app.innerHTML = `<div class="wrap report">
+    ${topbar(back)}
     <section class="panel stack">
-      ${state.result.timeUp ? '<span class="chip warn">Time ran out, so the test was submitted automatically.</span>' : ''}
+      ${res.timeUp ? '<span class="chip warn">Time ran out, so the test was submitted automatically.</span>' : ''}
       <div class="score-head">
         <div>
-          <span class="eyebrow">Score</span>
+          <span class="eyebrow">Performance report</span>
           <div class="score-big">${r.score}<small> / ${r.max}</small></div>
+          ${r.percent !== null ? `<span class="muted">${r.percent}% of the marks available</span>` : ''}
         </div>
-        <div class="stack" style="gap:8px">
+        <div class="stack" style="gap:6px">
           <h2 style="font-size:20px">${esc(quiz.title)}</h2>
-          <span class="muted">${fmtDate(a.submittedAt)} · ${fmtDuration(a.timeUsedSec)} of ${fmtDuration(a.durationSec)} used · +${a.settings.plus} / −${a.settings.minus} per question</span>
+          <span class="muted">${fmtWhen(a.startedAt || a.submittedAt)} · ${fmtDuration(a.timeUsedSec)} of ${fmtDuration(a.durationSec)} used · +${a.settings.plus} / −${a.settings.minus} per question</span>
         </div>
       </div>
-      <div class="bar" aria-hidden="true">
-        <i style="width:${pct(r.correct)};background:var(--good)"></i><i style="width:${pct(r.wrong)};background:var(--bad)"></i><i style="width:${pct(r.unscored)};background:var(--warn)"></i>
+      <div class="bar" role="img" aria-label="${r.correct} correct, ${r.wrong} wrong, ${r.skipped} not answered${r.unscored ? `, ${r.unscored} without a key` : ''}">
+        ${['correct', 'wrong', 'skipped', 'unscored'].filter((k) => r[k]).map((k) => `<i class="s-${k}" style="flex:${r[k]}"></i>`).join('')}
       </div>
       <div class="stats">
         <div class="stat good"><b>${r.correct}</b><span>Correct</span></div>
         <div class="stat bad"><b>${r.wrong}</b><span>Wrong</span></div>
         <div class="stat"><b>${r.skipped}</b><span>Not answered</span></div>
         ${r.unscored ? `<div class="stat"><b>${r.unscored}</b><span>No answer key</span></div>` : ''}
-        <div class="stat"><b>${r.accuracy === null ? '–' : `${r.accuracy}%`}</b><span>Accuracy</span></div>
+        <div class="stat"><b>${r.accuracy === null ? '–' : `${r.accuracy}%`}</b><span>Accuracy (of answered)</span></div>
         <div class="stat"><b>${r.attempted}/${total}</b><span>Attempted</span></div>
       </div>
-      ${r.unscored ? `<p class="muted" style="margin:0">${plural(r.unscored, 'question has', 'questions have')} no answer in the key. Add the key and this result is re-scored automatically.</p>` : ''}
-      <div class="row">
-        <button class="btn primary" data-action="setup" data-id="${quiz.id}">Take it again</button>
-        <button class="btn" data-action="edit" data-id="${quiz.id}">${r.unscored ? 'Add answer key' : 'Questions &amp; key'}</button>
-      </div>
+      ${r.unscored ? `<p class="muted" style="margin:0">${plural(r.unscored, 'question has', 'questions have')} no answer in the key. Add the key and this report is re-scored automatically.</p>` : ''}
     </section>
+
+    <div class="report-grid">
+      <section class="panel stack">
+        <h2 class="h-sec">Marks</h2>
+        <dl class="kv">
+          <div><dt>Earned from ${plural(r.correct, 'correct answer')}</dt><dd class="good-t">+${r.marks.gained}</dd></div>
+          <div><dt>Lost to ${plural(r.wrong, 'wrong answer')}</dt><dd class="bad-t">−${r.marks.lost}</dd></div>
+          <div class="sum"><dt>Final score</dt><dd>${r.score}</dd></div>
+        </dl>
+        <p class="muted note">${r.marks.lost ? `Negative marking cost you ${r.marks.lost} marks. Without it you would have ${r.marks.withoutNegative}.` : 'No marks were lost to negative marking.'}</p>
+      </section>
+      <section class="panel stack">
+        <h2 class="h-sec">Time</h2>
+        ${t.tracked ? `<dl class="kv">
+          <div><dt>Time used</dt><dd>${fmtClock(t.used)} of ${fmtClock(t.limit)}</dd></div>
+          <div><dt>Average per answered question</dt><dd>${t.perAnswered === null ? '–' : fmtClock(t.perAnswered)}</dd></div>
+          <div><dt>Average on correct answers</dt><dd>${t.perCorrect === null ? '–' : fmtClock(t.perCorrect)}</dd></div>
+          <div><dt>Average on wrong answers</dt><dd>${t.perWrong === null ? '–' : fmtClock(t.perWrong)}</dd></div>
+          <div><dt>Questions over 2 minutes</dt><dd>${t.over2min}</dd></div>
+        </dl>` : `<dl class="kv"><div><dt>Time used</dt><dd>${fmtClock(t.used)} of ${fmtClock(t.limit)}</dd></div></dl><p class="muted note">Time per question was not recorded for this attempt.</p>`}
+      </section>
+      <section class="panel stack">
+        <h2 class="h-sec">Review habits</h2>
+        <dl class="kv">
+          <div><dt>Marked for review</dt><dd>${r.marked.total}</dd></div>
+          <div><dt>… of those correct</dt><dd>${r.marked.correct}</dd></div>
+          <div><dt>… left unanswered</dt><dd>${r.marked.blank}</dd></div>
+          <div><dt>Answers changed</dt><dd>${r.changed.total}</dd></div>
+          <div><dt>… ended correct</dt><dd>${r.changed.correct}</dd></div>
+          <div><dt>Questions never opened</dt><dd>${r.notVisited}</dd></div>
+        </dl>
+      </section>
+    </div>
+
+    ${t.tracked ? `<section class="panel stack">
+      <div class="row"><h2 class="h-sec">Time on each question</h2><span class="spacer"></span><span class="muted note">In test order. Click a bar to jump to the question.</span></div>
+      ${timeChart(r)}
+      ${t.slowest.length ? `<p class="muted note">Slowest: ${t.slowest.map((x) => `Q${x.q.num} (${fmtClock(x.time)}, ${STATUS_LABEL[x.status].toLowerCase()})`).join(', ')}.</p>` : ''}
+    </section>` : ''}
+
+    <section class="panel stack">
+      <h2 class="h-sec">By question type</h2>
+      ${typeTable(r)}
+    </section>
+
+    ${past}
+
     <div class="filters">
-      <span class="eyebrow">Review</span>
-      <div class="seg" role="group" aria-label="Filter review">
-        ${seg('all', `All ${total}`)}${seg('correct', `Correct ${r.correct}`)}${seg('wrong', `Wrong ${r.wrong}`)}${seg('skipped', `Not answered ${r.skipped}`)}${markedCount ? seg('marked', `Marked ${markedCount}`) : ''}${r.unscored ? seg('unscored', `No key ${r.unscored}`) : ''}
+      <span class="eyebrow">Answers</span>
+      <div class="seg" role="group" aria-label="Filter answers">
+        ${seg('all', `All ${total}`)}${seg('correct', `Correct ${r.correct}`)}${seg('wrong', `Wrong ${r.wrong}`)}${seg('skipped', `Not answered ${r.skipped}`)}${markedCount ? seg('marked', `Marked ${markedCount}`) : ''}${changedCount ? seg('changed', `Changed ${changedCount}`) : ''}${r.unscored ? seg('unscored', `No key ${r.unscored}`) : ''}
       </div>
+      <span class="spacer"></span>
+      ${t.tracked ? `<div class="seg" role="group" aria-label="Order">
+        <button data-action="result-sort" data-v="order" aria-pressed="${res.sort === 'order'}">Test order</button>
+        <button data-action="result-sort" data-v="slowest" aria-pressed="${res.sort === 'slowest'}">Slowest first</button>
+      </div>` : ''}
+      ${quiz.hasPdf ? `<div class="seg" role="group" aria-label="Question view">
+        <button data-action="result-display" data-v="text" aria-pressed="${res.display === 'text'}">Text</button>
+        <button data-action="result-display" data-v="pdf" aria-pressed="${res.display === 'pdf'}">PDF</button>
+      </div>` : ''}
     </div>
     <div class="review-list">${list || '<div class="empty">Nothing in this list.</div>'}</div>
+    <div class="row" style="margin-top:20px">
+      ${state.testTab ? back : `<button class="btn primary" data-action="setup" data-id="${quiz.id}">Schedule it again</button><button class="btn" data-action="edit" data-id="${quiz.id}">Questions &amp; key</button>`}
+    </div>
   </div>`;
+
+  hydrateSnippets();
+  const plot = app.querySelector('.tchart-plot');
+  if (plot) {
+    const tip = plot.querySelector('.tip');
+    const show = (e) => {
+      const b = e.target.closest('.tbar');
+      if (!b) return;
+      tip.textContent = b.dataset.tip;
+      tip.hidden = false;
+      const pr = plot.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      const x = Math.min(Math.max(br.left - pr.left + br.width / 2, 60), pr.width - 60);
+      tip.style.left = `${x}px`;
+    };
+    plot.addEventListener('mouseover', show);
+    plot.addEventListener('focusin', show);
+    plot.addEventListener('mouseleave', () => (tip.hidden = true));
+    plot.addEventListener('focusout', () => (tip.hidden = true));
+  }
 }
 
 // ---------- events ----------
@@ -857,8 +1160,15 @@ const actions = {
   home() { state.view = 'library'; state.confirmDelete = null; state.importSummary = null; render(); },
   edit(el) { openEditor(el.dataset.id); },
   setup(el) { openSetup(el.dataset.id); },
-  resume(el) { openExam(state.attempts.find((a) => a.id === el.dataset.id)); },
+  'open-test'(el) { openTestTab(el.dataset.id); },
   'open-result'(el) { openResult(el.dataset.id); },
+  async 'cancel-scheduled'(el) {
+    await db.remove('attempts', el.dataset.id);
+    state.attempts = state.attempts.filter((a) => a.id !== el.dataset.id);
+    broadcast(el.dataset.id);
+    render();
+    toast('Scheduled test cancelled');
+  },
   'ask-delete'(el) { state.confirmDelete = el.dataset.id; render(); },
   'cancel-delete'() { state.confirmDelete = null; render(); },
   async 'delete-quiz'(el) {
@@ -907,17 +1217,22 @@ const actions = {
     toast('Question removed');
   },
 
-  // setup
+  // scheduling
   preset(el) { state.setup.minutes = +el.dataset.v; render(); },
   'setup-display'(el) { state.setup.display = el.dataset.v; render(); },
+  'start-test'() { startTest(true); },
 
   // exam
   async pick(el) {
     const a = state.attempt;
     const qid = a.order[a.current];
     const i = +el.dataset.i;
-    if (a.responses[qid] === i) delete a.responses[qid];
-    else a.responses[qid] = i;
+    const prev = a.responses[qid];
+    if (prev === i) delete a.responses[qid];
+    else {
+      if (prev !== undefined) a.changes[qid] = (a.changes[qid] || 0) + 1;
+      a.responses[qid] = i;
+    }
     await saveAttempt(a);
     render();
   },
@@ -958,8 +1273,8 @@ const actions = {
   },
   'exam-display'(el) {
     state.exam.display = el.dataset.v;
-    state.quiz.settings.display = el.dataset.v;
-    saveQuiz(state.quiz);
+    state.attempt.display = el.dataset.v;
+    saveAttempt(state.attempt);
     render();
   },
   'toggle-palette'() { state.exam.paletteOpen = !state.exam.paletteOpen; render(); },
@@ -967,11 +1282,43 @@ const actions = {
   'ask-quit'() { state.exam.modal = 'quit'; render(); },
   'close-modal'() { state.exam.modal = null; render(); },
   'confirm-submit'() { submitExam(false); },
-  'leave-exam'() { state.view = 'library'; render(); },
+  async 'leave-exam'() {
+    await saveAttempt(state.attempt, true);
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    leaveTestTab();
+  },
 
-  // results
+  // report
   'result-filter'(el) { state.result.filter = el.dataset.v; render(); },
+  'result-sort'(el) { state.result.sort = el.dataset.v; render(); },
+  'result-display'(el) { state.result.display = el.dataset.v; render(); },
+  'goto-q'(el) {
+    if (state.result.filter !== 'all') {
+      state.result.filter = 'all';
+      render();
+    }
+    document.getElementById(`rev-${el.dataset.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  },
+  'close-tab'() { leaveTestTab(); },
 };
+
+/** Closes a test tab that QuizMaster opened; otherwise goes back to the library in this tab. */
+function leaveTestTab() {
+  if (state.testTab) {
+    window.close();
+    // Still here: the tab was not opened by script, so show the library instead.
+    setTimeout(() => {
+      state.testTab = null;
+      document.body.classList.remove('test-tab');
+      history.replaceState(null, '', `${location.pathname}${location.search}`);
+      document.title = 'QuizMaster';
+      reloadLibrary();
+    }, 150);
+  } else {
+    state.view = 'library';
+    render();
+  }
+}
 
 function keepScroll() {
   const y = window.scrollY;
@@ -995,7 +1342,7 @@ app.addEventListener('submit', async (e) => {
   const form = e.target;
   e.preventDefault();
   if (form.dataset.form === 'start') {
-    startExam();
+    scheduleTest();
   } else if (form.dataset.form === 'edit-q') {
     const q = state.quiz.questions.find((x) => x.id === form.dataset.id);
     const f = new FormData(form);
@@ -1030,12 +1377,60 @@ document.addEventListener('keydown', (e) => {
   e.preventDefault();
 });
 
+// Save the running test when the tab is hidden or closed.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && state.view === 'exam' && state.attempt) saveAttempt(state.attempt);
+  state.lastTick = null;
+});
+
+// ---------- keeping tabs in step ----------
+
+const channel = 'BroadcastChannel' in window ? new BroadcastChannel('quizmaster') : null;
+
+function broadcast(attemptId) {
+  if (channel) channel.postMessage({ type: 'attempt', id: attemptId });
+}
+
+if (channel) {
+  channel.onmessage = async (e) => {
+    if (state.testTab || !e.data || e.data.type !== 'attempt') return;
+    const fresh = await db.get('attempts', e.data.id);
+    state.attempts = state.attempts.filter((a) => a.id !== e.data.id);
+    if (fresh) state.attempts.push(fresh);
+    if (state.view === 'library') render();
+  };
+}
+
+window.addEventListener('hashchange', () => {
+  const m = /^#test-(.+)$/.exec(location.hash);
+  if (m && m[1] !== state.testTab) enterTestTab(m[1]);
+});
+
 // ---------- boot ----------
 
-async function boot() {
+async function reloadLibrary() {
   try {
     state.quizzes = await db.getAll('quizzes');
     state.attempts = await db.getAll('attempts');
+  } catch (err) {
+    console.error(err);
+  }
+  // A test whose time ran out while its tab was closed is submitted now.
+  for (const a of state.attempts) {
+    if (a.status === 'in-progress' && a.endsAt <= Date.now()) await finishExpired(a);
+  }
+  state.view = 'library';
+  render();
+}
+
+async function boot() {
+  const m = /^#test-(.+)$/.exec(location.hash);
+  if (m) {
+    await enterTestTab(m[1]);
+    return;
+  }
+  try {
+    state.quizzes = await db.getAll('quizzes');
   } catch (err) {
     console.error(err);
   }
@@ -1043,17 +1438,7 @@ async function boot() {
     const sample = window.QUIZMASTER_SAMPLE;
     await saveQuiz({ ...sample, id: db.uid('quiz'), createdAt: Date.now(), updatedAt: Date.now(), hasPdf: false });
   }
-  // A test whose time ran out while the page was closed is submitted now.
-  for (const a of state.attempts) {
-    if (a.status === 'in-progress' && a.endsAt <= Date.now()) {
-      a.status = 'submitted';
-      a.submittedAt = a.endsAt;
-      a.timeUsedSec = a.durationSec;
-      a.autoSubmitted = true;
-      await saveAttempt(a);
-    }
-  }
-  render();
+  await reloadLibrary();
 }
 
 boot();

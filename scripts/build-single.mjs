@@ -14,7 +14,7 @@ const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1
 const out = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--sample') || path.join(root, 'dist/quizmaster.html');
 
 // Modules in dependency order.
-const modules = ['parser.js', 'extract.js', 'answerkey.js', 'store.js', 'pdfview.js', 'app.js'];
+const modules = ['parser.js', 'extract.js', 'answerkey.js', 'report.js', 'store.js', 'pdfview.js', 'app.js'];
 const ident = (file) => `__mod_${file.replace(/\W/g, '_')}`;
 
 const chunks = modules.map((file) => {

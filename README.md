@@ -4,8 +4,8 @@ QuizMaster turns a PDF question paper into a timed multiple-choice test that run
 
 1. **Import a PDF.** The app finds each numbered question, its statements or tables, and options (a)–(d). Options are shown as 1–4.
 2. **Add the answer key.** Paste it in almost any format, load it from a text or PDF file, or click the correct option on each question.
-3. **Take the test.** You get a timer, a question palette and the usual exam controls: select, unselect, clear response, mark for review, previous, and save & next.
-4. **Review the result.** You see your score with negative marking and a per-question review of your answer against the correct one.
+3. **Schedule the test.** Pick the time limit, marking scheme, question range and start time: now, or a set date and time. The test opens in its own tab with instructions and, for a set time, a countdown that starts the test on its own. The test tab has a timer, a question palette and the usual exam controls: select, unselect, clear response, mark for review, previous, and save & next. When time runs out, the test is submitted automatically.
+4. **Read the performance report.** It opens in the test tab as soon as the test ends. It shows your score with negative marking, correct, wrong and unanswered counts, accuracy, marks lost to negative marking, time per question (as a chart), accuracy by question type, review-mark and answer-change habits, and your earlier attempts. Below that is every question with your answer and the correct one.
 
 Each question can be shown as parsed **text**, as the original **PDF snippet** cropped from the page, or both.
 
@@ -61,7 +61,7 @@ Letters `a–d` and numbers `1–4` mean the same option.
 
 ```bash
 npm install                                   # pdfjs-dist, used by the Node scripts
-npm test                                      # unit tests (parser, answer key)
+npm test                                      # unit tests (parser, answer key, report)
 node scripts/parse-pdf.mjs paper.pdf --show all      # print what the parser finds
 node scripts/parse-pdf.mjs paper.pdf --json out.json
 node scripts/debug-lines.mjs paper.pdf 3,4           # the laid-out lines on pages 3 and 4
@@ -74,6 +74,7 @@ node scripts/debug-lines.mjs paper.pdf 3,4           # the laid-out lines on pag
 | `js/answerkey.js` | answer key text → answers |
 | `js/pdfview.js` | loads pdf.js in the browser and draws question snippets |
 | `js/store.js` | IndexedDB storage |
-| `js/app.js` | the interface: library, editor and key, test setup, exam, results |
+| `js/report.js` | scoring and performance statistics |
+| `js/app.js` | the interface: library, editor and key, scheduling, the test tab, the report |
 
 Tested on the UPPCS Prelims 2025 GS Paper I (Drishti edition, 49 pages, Hindi and English on alternate pages). All 150 English questions were extracted with 4 options each, and the Hindi pages were skipped.
