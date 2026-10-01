@@ -70,7 +70,7 @@ function findGutter(page) {
     for (let x = a; x < b; x++) cover[x]++;
   }
   const tolerance = Math.floor(items.length * 0.01);
-  let best = null;
+  const runs = [];
   let runStart = null;
   const lo = Math.floor(W * 0.28);
   const hi = Math.ceil(W * 0.72);
@@ -80,16 +80,20 @@ function findGutter(page) {
     if (!open && runStart !== null) {
       const width = x - runStart;
       const center = (runStart + x) / 2;
-      const score = width - Math.abs(center - W / 2) * 0.25;
-      if (width >= 4 && (!best || score > best.score)) best = { center, score };
+      if (width >= 4) runs.push({ center, score: width - Math.abs(center - W / 2) * 0.25 });
       runStart = null;
     }
   }
-  if (!best) return null;
-  const left = items.filter((it) => it.x < best.center).length;
-  const right = items.length - left;
-  if (left < items.length * 0.15 || right < items.length * 0.15) return null;
-  return best.center;
+  // Take the best-placed empty strip that has a real column of text on each side. (A gap inside
+  // one column, e.g. between widely spaced characters, fails that test; try the next strip.)
+  // Measured by text width, not item count: some fonts give one item per character.
+  runs.sort((a, b) => b.score - a.score);
+  const total = items.reduce((n, it) => n + it.w, 0);
+  for (const run of runs) {
+    const left = items.reduce((n, it) => n + (it.x < run.center ? it.w : 0), 0);
+    if (left >= total * 0.15 && total - left >= total * 0.15) return run.center;
+  }
+  return null;
 }
 
 function buildLines(items, pageNo, col) {
@@ -158,7 +162,10 @@ function layoutLines(pages) {
   const columns = []; // { page, index, count, lines }
   for (const p of pages) {
     const split = findGutter(p);
-    const parts = split === null ? [p.items] : [p.items.filter((i) => i.x < split), p.items.filter((i) => i.x >= split)];
+    // A right-column question number can start a few points left of the gutter's middle, so an item
+    // goes right when most of it lies right of the split, or it starts just short of it.
+    const goesRight = (i) => i.x + i.w / 2 >= split || i.x >= split - 8;
+    const parts = split === null ? [p.items] : [p.items.filter((i) => !goesRight(i)), p.items.filter(goesRight)];
     parts.forEach((items, index) => {
       const lines = buildLines(items, p.page, index).filter(
         (l) => !(PAGE_NUMBER.test(l.text) && (l.top < p.height * 0.08 || l.bottom > p.height * 0.9))
@@ -734,4 +741,4 @@ export function parseQuestions(inputPages) {
     },
   };
 }
-export const _internal = { removeRepeatedText, layoutLines, filterEnglish, segment, chooseOptions, findMarkers, FAMILIES };
+export const _internal = { findGutter, removeRepeatedText, layoutLines, filterEnglish, segment, chooseOptions, findMarkers, FAMILIES };

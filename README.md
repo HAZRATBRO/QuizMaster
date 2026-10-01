@@ -92,4 +92,5 @@ Tested on three versions of UPPSC Prelims 2025 GS Paper I:
 | --- | --- | --- |
 | Drishti IAS edition, 49 pages | Two columns, Hindi (legacy font) and English on alternate pages | 150/150 questions, 150 with 4 options |
 | Physics Wallah edition, 79 pages | Answer-key table on page 2, then each question in English and Unicode Hindi, adverts between | 150/150 questions and 150/150 answers read from the key |
+| Drishti IAS mock test booklet, 40 pages | English and Unicode Hindi side by side on every page, Hindi set one item per character | 150/150 questions, 150 with 4 options |
 | Scanned question booklet, 60 pages | Photocopy with an OCR text layer, English and Hindi side by side, GS Paper II appended | 150/150 questions found; many options unreadable in the text, so shown from the scan |
